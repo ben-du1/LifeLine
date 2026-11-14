@@ -4,7 +4,7 @@ import { appendFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 
 function save(name, value) {
-  appendFileSync(new URL("../.env.local", import.meta.url), "\n" + name + "=" + value + "\n");
+  appendFileSync(new URL("../.env", import.meta.url), "\n" + name + "=" + value + "\n");
   process.env[name] = value;
 }
 

@@ -20,10 +20,9 @@ def _load_dotenv(path: Path) -> None:
         os.environ.setdefault(key.strip(), value.strip())
 
 
-_load_dotenv(REPO_ROOT / ".env.local")
 _load_dotenv(REPO_ROOT / ".env")
 
-# Shared bearer credential for ElevenLabs voice tools; provisioning stores it in .env.local.
+# Shared bearer credential for ElevenLabs voice tools; provisioning stores it in .env.
 VOICE_TOOL_TOKEN = os.environ.get("VOICE_TOOL_TOKEN", "")
 
 MATTERPORT_API_URL = "https://api.matterport.com/api/models/graph"

@@ -14,14 +14,14 @@ after a backend restart. Full voice turns are serialized per conversation.
 
 ## Local configuration
 
-Onboarding creates the gitignored root .env.local with ELEVENLABS_API_KEY.
-Provisioning also saves ELEVENLABS_AGENT_ID, ELEVENLABS_VOICE_SECRET_ID, VOICE_TOOL_TOKEN,
-and VOICE_PUBLIC_URL there. Do not commit this file or paste its contents into chat.
-The backend loads .env.local before .env; actual process environment variables take priority.
+Use the gitignored **project-root .env** for Matterport, optional Claude, and ElevenLabs settings.
+It contains ELEVENLABS_API_KEY, ELEVENLABS_AGENT_ID, ELEVENLABS_VOICE_SECRET_ID,
+VOICE_TOOL_TOKEN, and VOICE_PUBLIC_URL. The backend, gateway, and setup helper read .env;
+.env.local is not used. Existing process environment variables take priority.
+Do not commit .env or paste its contents into chat.
 
-The existing Matterport and optional Claude credentials still belong in root .env.
-This checkout currently needs its normal Python backend dependencies and Matterport credentials
-before it can locate real rooms. Follow the main README's backend installation steps.
+Provisioning saves generated voice identifiers and credentials into .env.
+Follow the main README's backend installation steps before running real room-location calls.
 
 ## Start the services
 
@@ -65,25 +65,28 @@ Quick Tunnels are intended for development; use a stable tunnel/deployment for a
 
 ## Connect the Photon number
 
-Your current shared iMessage assignment cannot receive voice calls. First obtain an eligible
-Photon SMS number, WhatsApp number, or dedicated iMessage line.
+Use an eligible Photon SMS number or dedicated messaging line. Shared iMessage assignments
+cannot receive voice. Use your personal phone to call the Photon number.
 
-1. In Photon Voice, create/select a SIP profile for that number. Set media encryption to Auto.
-2. Enable outbound using SHA-256. Save the generated SIP username and password securely.
-3. In ElevenLabs Deploy > Phone Numbers, import the Photon number From SIP Trunk (E.164 format).
-4. Set outbound Address to the server and TLS port displayed by Photon (e.g. sip.photon.codes:5061,
-   without a sip: prefix), Transport TLS, media encryption Allowed, and Photon's SIP username/password.
-5. Assign the agent named HackPrinceton Photon Room Locator to that imported number.
-6. In Photon inbound settings, set sips:sip.rtc.elevenlabs.io:5061 with TLS.
-   For the cookbook's initial setup, ElevenLabs inbound media is Allowed, allowed sources are
-   0.0.0.0/0, and inbound SIP credentials are empty on both sides. If you enable inbound
-   authentication, use the same separate inbound credentials on both platforms.
-7. Call the Photon number from another phone. Give the building address and city, then describe
-   the room. Check that the dashboard displays the session, backend-selected follow-up questions,
-   room/floor estimates, and later corrections.
+For an incoming-only demo:
+1. In Photon Voice, create/select the number's SIP profile. Set media encryption to Auto.
+2. In ElevenLabs Deploy > Phone Numbers > Import number > From SIP Trunk, enter the Photon number.
+3. Set inbound media encryption to Allowed. Outbound configuration can stay disabled;
+   an outbound SIP password is not required for incoming-only calls.
+4. Assign HackPrinceton Photon Room Locator and the intended published branch to the imported number.
+5. Set Photon inbound destination to sips:sip.rtc.elevenlabs.io:5061 with TLS.
+   If you enable inbound SIP authentication, use the same inbound username/password on both platforms.
+6. Call the Photon number, give the address, and describe the room. Watch the dashboard for
+   backend-selected questions, room/floor estimates, and later corrections.
+   The dashboard's Start call button remains the text/simulated entry point.
 
-Photon SIP credentials are different from PHOTON_API_KEY and ELEVENLABS_API_KEY.
-No Photon SIP settings or phone-number imports are performed by the agent setup command.
+DEV_TEST_PHONE only prefills the dashboard caller field. After changing it in .env,
+restart the FastAPI backend and refresh the browser; leave the gateway and tunnel running.
+Restart both backend and gateway after changing VOICE_TOOL_TOKEN.
+
+The agent and its saved tool bindings have been verified, with eight Python checks and one
+gateway check passing. Live phone delivery and model inference were not verified by those
+checks. See the main README for the full architecture, environment reference, and demo steps.
 
 ## Checks without live calls
 
@@ -94,7 +97,7 @@ cd ..\voice
 npm test
 ```
 
-Transport tests use a fake session manager; they do not exercise live Matterport or model inference.
+Bridge tests use a fake session manager; pipeline tests use deterministic model outputs. They do not exercise live Matterport or model inference.
 The agent speaks demo wording and does not claim to have contacted emergency services.
 
 Sources:

@@ -23,15 +23,17 @@ Built for the CoStar × Matterport track ("Inside and Out: AI for the Built Worl
 
 When people are trapped or lost inside a building during an emergency, they often cannot find the exit and must
 rely on first responders to reach them. Responders usually know the building's address, but not where inside the
-building the caller is. This tool helps a dispatcher find a caller's position on a floorplan, using only a short
-text conversation with the caller.
+building the caller is. This tool helps a dispatcher find a caller's position on a floorplan, using a short
+text or voice conversation with the caller.
 
 ## How it works
 
-1. **911 call comes in.** The caller's phone number and address are forwarded to our program. For this MVP they are
-   entered on the dispatcher dashboard (simulated 911 input).
+1. **A demo session starts.** For text/simulated mode, enter the caller's phone and address on the dispatcher
+   dashboard. For voice mode, call the Photon demo number; ElevenLabs asks for the address and starts the backend
+   session automatically. This is not connected to actual 911 dispatch.
 2. **Two things start in parallel:**
-   - The program texts the caller over iMessage (via Photon) and asks them to describe the room they are in.
+   - The program asks the caller to describe the room: over iMessage/simulation for text sessions, or through
+     ElevenLabs speech for voice sessions.
    - The address is matched to the Matterport digital twin whose address is most similar. The match does not have
      to be exact (see "Address matching"), and approximate matches are flagged to the dispatcher. The building is
      downloaded and embedded the first time, and read from the local cache afterwards.
@@ -70,7 +72,7 @@ text conversation with the caller.
 - Basements: Matterport floor labels are just "Floor 1", "Floor 2", ..., so the lowest floor is treated as the
   ground floor.
 - Addresses with no Matterport model: the session is marked "no interior model" and no location is attempted.
-- Real 911 integration (call data is typed into the dashboard).
+- Real 911 integration. Voice demos use a normal Photon phone number; dashboard input simulates dispatch.
 - CoStar data (not used: the extract is property, lease and sale records, with no roads or imagery). Vexcel aerial
   imagery was integrated, then removed (see "Orientation").
 
@@ -94,6 +96,7 @@ text conversation with the caller.
 | Component  | Path         | Tech                              | Responsibility |
 |------------|--------------|-----------------------------------|----------------|
 | Backend    | `backend/`   | Python 3.11, FastAPI, open_clip   | Sessions, building ingest, matching, question choice, REST + WebSocket API |
+| Voice      | `voice/`     | Node 22.9+ (tested with 24), ElevenLabs SDK | Agent provisioning and authenticated voice-only HTTP gateway (:8788) |
 | Messaging  | `messaging/` | Node 20+, `fetch` (Photon REST)   | Sends iMessages for the backend; forwards caller replies to the backend |
 | Dashboard  | `dashboard/` | React + Vite                      | Simulated 911 form, live conversation, room probabilities, floor plan with dot |
 | Cache      | `data/`      | Files on disk (gitignored)        | Building JSON, skybox images, floorplan image, embeddings |
@@ -104,7 +107,7 @@ Sessions are kept in memory in the backend (restarting the backend clears them).
 
 | Module          | Purpose |
 |-----------------|---------|
-| `config.py`     | Loads `.env`, paths, and tunable constants (thresholds, temperature, max questions). |
+| `config.py`     | Loads the root `.env`, paths, and tunable constants (thresholds, temperature, max questions). |
 | `matterport.py` | Minimal GraphQL client (HTTP Basic auth), the queries we use, model search and match ranking. |
 | `addresses.py`  | Fuzzy address similarity (street, house number, city/state/ZIP) for picking a model. |
 | `ingest.py`     | Downloads every floor's rooms (with wall outlines), sweeps, skybox faces and floorplans; computes embeddings. Also a CLI. |
@@ -118,6 +121,8 @@ Sessions are kept in memory in the backend (restarting the backend clears them).
 | `questions.py`  | Opening/closing messages and reply parsing (yes / no / free text / unsure). |
 | `sessions.py`   | Session state machine and conversation flow. |
 | `messaging.py`  | Outbound messages: `simulated` (dashboard only) or `photon` (via the sidecar). |
+| `voice.py`      | Voice conversation binding, original-transcript extraction, retry protection, queued results, and demo speech wording. |
+| `voice_routes.py` | Authenticated `/api/voice/start`, `/reply`, and `/status` routes. |
 | `main.py`       | FastAPI routes, WebSocket broadcast, static files for cached building assets. |
 
 ### API
@@ -130,12 +135,16 @@ Sessions are kept in memory in the backend (restarting the backend clears them).
 | GET    | `/api/sessions/{id}`           | One session snapshot |
 | GET    | `/api/sessions/{id}/rooms`     | Every room of the call's building, most likely first: `{index, name, types, floor, area_m2, probability, sweeps[{candidate, x, y, probability, views[url]}]}` |
 | POST   | `/api/sessions/{id}/reply`     | `{text}`: simulated caller reply from the dashboard |
+| POST   | `/api/voice/start`             | Bearer-authenticated `{conversation_id, address, phone?}`: starts a voice session |
+| POST   | `/api/voice/reply`             | Bearer-authenticated `{conversation_id, history}`: processes original transcript answer |
+| POST   | `/api/voice/status`            | Bearer-authenticated `{conversation_id}`: polls queued results |
 | POST   | `/api/inbound`                 | `{from, text}`: real caller reply, posted by the messaging sidecar |
 | WS     | `/ws`                          | Pushes `{type: "session", session}` on every change |
 | GET    | `/api/buildings/{model_id}`    | Cached `building.json` (`floors`, `floorplans` per floor, rooms with `floor`/walls/polygon/centroid, candidates) with asset URLs, plus `orientation` (`yaw_deg`, `street{name, distance_m, bearing_deg, side, direction_deg}`) once fetched |
 | GET    | `/buildings/{model_id}/...`    | Cached floorplan and view images |
 
-Session snapshot fields: `id, phone, address, status, status_detail, model_id`,
+Session snapshot fields: `id, phone, address, status, status_detail, model_id, channel`,
+where `channel` is `messaging` or `voice`,
 `match{id, name, address, score, exact}` (the Matterport property in use), `messages[{role, text, ts}]`
 (`role` is `dispatch`, `caller` or `system`), `questions_asked, max_questions`,
 `rooms[{index, name, floor, floor_label, probability}]` (sorted), `floors[{index, label, probability}]`,
@@ -463,9 +472,163 @@ of picking one confidently.
   - the locator updated its estimate and asked the next question each time.
 - `MESSAGING_MODE=simulated` (default) skips the sidecar entirely; `MESSAGING_MODE=photon` sends via the sidecar.
 
+## Voice calling (Photon + ElevenLabs)
+
+The calling path is separate from the iMessage sidecar:
+
+```text
+Personal phone -> Photon demo number -> SIP/TLS -> ElevenLabs agent
+                                                   |
+                                          authenticated HTTPS tools
+                                                   |
+                                           Cloudflare Tunnel
+                                                   |
+                                      voice/gateway.mjs (:8788)
+                                                   |
+                                   FastAPI /api/voice/* (:8000)
+                                                   |
+                                    existing SessionManager
+                                                   |
+                           parsing / semantics / follow-ups / locator
+                                                   |
+                            spoken answer via ElevenLabs + Photon
+
+Dispatcher dashboard (:5173) <- existing WebSocket updates from FastAPI
+```
+
+ElevenLabs handles speech recognition, conversation orchestration, and speech synthesis. It
+sends the original conversation transcript to the backend; the backend selects the questions
+and estimates the room, floor, and position. It continues accepting corrections after an
+initial location estimate. Voice sessions use `channel="voice"`, skip iMessage sending, and
+are excluded from the iMessage phone-number lookup.
+
+The generated agent is **HackPrinceton Photon Room Locator**:
+[agent editor](https://elevenlabs.io/app/agents/agents/agent_2201m7dz61kvfmbasg1ey39zjnks).
+Its setup currently selects Gemini 2.5 Flash, the Sarah voice, and `eleven_flash_v2` TTS.
+No additional cost/token optimization has been implemented or measured.
+
+### Voice tools and gateway
+
+| ElevenLabs tool | Backend endpoint | Purpose |
+|---|---|---|
+| `start_location` | `POST /api/voice/start` | Creates a voice session from the caller's address and phone, bound to the platform conversation ID |
+| `submit_location_answer` | `POST /api/voice/reply` | Passes the latest original caller answer through the existing session pipeline |
+| `location_status` | `POST /api/voice/status` | Polls for the result of a queued answer while the building loads |
+
+The start body is `{conversation_id, address, phone?}`; reply takes
+`{conversation_id, history}`, where `history` is ElevenLabs' JSON-serialized transcript;
+status takes `{conversation_id}`. Responses include `session_id`, `status`, `pending`,
+`say`, and instructions for the agent. The platform injects conversation identity, caller
+number, and history through system dynamic variables rather than asking the LLM to invent them.
+
+Both the backend routes and gateway require `Authorization: Bearer <VOICE_TOOL_TOKEN>`.
+The gateway exposes only those three POST routes, limits request size, and rejects dispatcher
+APIs, building assets, and WebSockets. The agent references a stored ElevenLabs workspace secret.
+Requests are serialized per voice conversation; replayed transcript turns reuse the existing
+result so retries do not update the locator twice. The same answer on a later turn is still
+processed. If a reply is queued while loading, the agent polls status rather than resubmitting it.
+
+`voice/setup.mjs` uses the ElevenLabs SDK to create the agent, or update the agent identified
+by `ELEVENLABS_AGENT_ID`. It saves generated identifiers, the gateway token, and tunnel URL
+in the root `.env`. Setup does not place calls or generate an audio test.
+
+### Connect a demo phone number
+
+Use a separate, eligible Photon number as the number people call. A personal phone can call
+that demo number; `DEV_TEST_PHONE` is not how the Photon number is assigned. Shared iMessage
+assignments cannot receive voice calls. Acquire an eligible SMS number or dedicated messaging
+line in Photon, or ask the Photon team to provision a voice-capable number.
+
+For an **incoming-only** demo:
+
+1. In Photon **Voice**, create/select a SIP profile for the eligible number.
+2. In ElevenLabs **Deploy > Phone Numbers > Import number > From SIP Trunk**, enter the
+   **Photon number** in international format. Set inbound media encryption to **Allowed**.
+   Leave outbound calling disabled; an outbound SIP password is not required for this path.
+3. Open the imported number and assign **HackPrinceton Photon Room Locator** and the intended
+   published branch/version.
+4. In Photon inbound settings, set destination `sips:sip.rtc.elevenlabs.io:5061`, transport
+   **TLS**, and media encryption **Auto**. If inbound SIP authentication is enabled in
+   ElevenLabs, enter that same inbound credential pair in Photon.
+5. Call the Photon demo number from a separate phone. Confirm the agent hears you, speaks
+   replies, and the dispatcher dashboard receives the resulting session.
+
+The phone number is imported at ElevenLabs' **Phone Numbers** page, then assigned to the agent;
+it is not entered into the agent prompt or `DEV_TEST_PHONE`. Phone routing and backend HTTPS
+tool routing are separate connections: both must work for the full demo.
+
+References: [Photon incoming-call setup](https://photon.codes/docs/beta/get-started/voice)
+and [incoming/outgoing SIP cookbook](https://photon.codes/docs/beta/cookbooks/voice/elevenlabs).
+
+### Start voice mode
+
+Use the root `.env` for all credentials. Run the backend and dashboard using the Setup
+commands below. Do not run the iMessage sidecar just for voice mode; `MESSAGING_MODE`
+controls text sessions, while voice sessions choose their own transport.
+
+In a new PowerShell terminal:
+
+```powershell
+cd C:\Users\Joshua\Projects\hackprinceton-mvp\voice
+$env:NODE_OPTIONS='--use-system-ca'
+npm install
+npm start
+```
+
+The gateway listens on `127.0.0.1:8788` and forwards to `BACKEND_URL` (default
+`http://localhost:8000`). In another terminal, run:
+
+```powershell
+cloudflared tunnel --url http://127.0.0.1:8788 --no-autoupdate
+```
+
+If `cloudflared` is not on PATH, a temporary copy was downloaded during setup to
+`C:\Users\Joshua\AppData\Local\Temp\elevenlabs-skills-hJr7VU\cloudflared.exe`.
+Invoke that executable directly or install Cloudflare Tunnel normally.
+
+Copy the generated HTTPS URL, then configure the agent from the `voice` folder:
+
+```powershell
+npm run setup -- https://YOUR-HOST.trycloudflare.com
+```
+
+The helper updates the saved agent rather than creating another one. Restart the backend
+and gateway after setup if they were already running, so both read the saved token.
+Keep the backend, gateway, and tunnel running throughout the demo. The dashboard server
+must also run if the dispatcher should see live results. Quick Tunnel URLs change on restart:
+run setup again with the new URL. Do not tunnel directly to the unrestricted backend.
+
+### Voice verification and limits
+
+The real ElevenLabs agent was created and its saved model, tool URLs, and dynamic-variable
+bindings were read back successfully. The onboarding check verified the key and SDK integration.
+**An end-to-end Photon phone call has not been verified in this development session.**
+
+Eight Python voice checks and one Node gateway check passed. The pipeline tests exercised the
+existing parser/planner, semantic-cue routing, floor selection, and a correction from an
+upstairs estimate to the downstairs kitchen, using deterministic model outputs. They did not
+run live CLIP/MiniLM inference, contact Matterport, send texts, or make phone calls.
+
+With the normal backend dependencies installed:
+
+```powershell
+cd C:\Users\Joshua\Projects\hackprinceton-mvp\backend
+.venv\Scripts\python -m unittest discover -s tests -p "test_voice*.py"
+cd ..\voice
+npm test
+```
+
+Voice sessions and retry records are in memory. Use a single backend worker; restarting it
+clears the sessions, so start a new phone conversation. Voice messages identify this as a
+demo and do not claim that real emergency services or responders have been contacted.
+See [voice/README.md](voice/README.md) for the focused voice setup guide.
+
 ## Setup
 
-Requirements: Python 3.11+, Node.js 20+, and the credentials below in `.env` (copy `.env.example`; never commit `.env`).
+Requirements: Python 3.11+, Node.js 20+ for messaging/dashboard and 22.9+ for the voice scripts
+(tested with Node 24), and credentials in the **project-root `.env`**. Copy `.env.example` if needed;
+never commit `.env` or expose its contents. Existing process environment variables take precedence.
+The backend and voice scripts read `.env`; `.env.local` is not used for runtime configuration.
 
 | Variable                  | Used by   | Notes |
 |---------------------------|-----------|-------|
@@ -473,11 +636,17 @@ Requirements: Python 3.11+, Node.js 20+, and the credentials below in `.env` (co
 | `MATTERPORT_TOKEN_SECRET` | backend   | |
 | `PHOTON_PROJECT_ID`       | messaging | Photon Beta project id (`pho_prj_…`) |
 | `PHOTON_API_KEY`          | messaging | Photon Beta project API key (`pho_sk_…`, needs project read/write) |
-| `DEV_TEST_PHONE`          | dashboard default | Phone number prefilled in the simulated 911 form |
+| `DEV_TEST_PHONE`          | dashboard default | Personal caller number prefilled in the dashboard form; not the Photon demo number |
 | `MESSAGING_MODE`          | backend   | `simulated` (default) or `photon` |
 | `ANTHROPIC_API_KEY`       | backend   | Optional. Turns on Claude follow-ups (`llm.py`); leave empty for keyword rules |
 | `MESSAGING_SIDECAR_URL`   | backend   | Default `http://localhost:8787` |
-| `BACKEND_URL`             | messaging, dashboard proxy | Default `http://localhost:8000` |
+| `BACKEND_URL`             | messaging, voice gateway, dashboard proxy | Default `http://localhost:8000` |
+| `ELEVENLABS_API_KEY`       | voice setup | Private ElevenLabs API key; root `.env` only |
+| `ELEVENLABS_AGENT_ID`      | voice setup | Created agent ID; reused on setup updates |
+| `ELEVENLABS_VOICE_SECRET_ID` | voice setup | Stored ElevenLabs workspace secret for gateway authentication |
+| `VOICE_TOOL_TOKEN`        | backend, gateway, setup | Shared bearer credential generated by voice setup |
+| `VOICE_PUBLIC_URL`        | voice setup | HTTPS tunnel URL used by the agent's server tools |
+| `VOICE_GATEWAY_PORT`      | voice gateway | Default `8788` |
 
 ```bash
 # Backend
@@ -498,12 +667,28 @@ cd dashboard && npm install && npm run dev        # http://localhost:5173
 cd messaging && npm start                         # no dependencies; the caller's phone must text the shared line first
 ```
 
-Tests: `cd backend && .venv/Scripts/python -m pytest` (44 tests). `test_semantics.py` downloads the ~90 MB
+Tests: `cd backend && .venv/Scripts/python -m pytest` (existing locator tests plus the added voice tests). `test_semantics.py` downloads the ~90 MB
 paraphrase model on first run; the rest need no network.
 Scenario check: `cd backend && .venv/Scripts/python scripts/eval_scenarios.py [-v]` (ingests the three test
 buildings on first run).
 
+### Changing the caller number and restarting
+
+Set `DEV_TEST_PHONE=+1YOURNUMBER` in the root `.env` using international format. Restart the
+**FastAPI backend** (Ctrl+C in its terminal, then run the same uvicorn command again) and fully
+refresh the dashboard. The form only prefills an empty phone field. This setting does not change
+the Photon number or ElevenLabs assignment. A caller-number-only change does not require
+restarting the dashboard server, gateway, or tunnel. For a changed `VOICE_TOOL_TOKEN`, restart
+both backend and gateway and update the agent's secret/configuration consistently.
+
 ## Demo script
+
+For **voice**, first complete the Voice calling setup above. Open the dashboard, call the Photon
+number from your personal phone, provide the address, and describe the room. The session appears
+automatically; do **not** use the dashboard's `Start call` button to initiate that phone session.
+That button still creates a text/simulated session. Do not dial actual 911 for this demo.
+
+For **text/simulated** mode:
 
 1. Open the dashboard and enter a phone number and `13122 Chipman Glen Dr, Houston, TX`.
 2. As the caller (simulated box, or a real phone in `photon` mode), describe the room. The sample house is empty,

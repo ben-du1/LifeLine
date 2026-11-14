@@ -49,3 +49,14 @@ def test_information_gain_ignores_splits_within_one_room():
 def test_apply_likelihood_is_bayes_rule():
     post = locator.apply_likelihood(np.array([0.5, 0.5]), np.array([0.9, 0.3]))
     assert np.allclose(post, [0.75, 0.25])
+
+
+def test_in_room_update_keeps_room_totals_and_softens_the_split():
+    candidate_room = np.array([0, 0, 0, 1])
+    prior = locator.uniform_room_prior(candidate_room, 2)
+    scores = np.array([0.30, 0.25, 0.25, 0.29])
+    sharp = locator.update(prior, scores)
+    soft = locator.update(prior, scores, candidate_room=candidate_room)
+    assert np.allclose(locator.room_probabilities(sharp, candidate_room, 2),
+                       locator.room_probabilities(soft, candidate_room, 2))
+    assert soft[0] / soft[:3].sum() < sharp[0] / sharp[:3].sum()     # less sure *where* in room 0

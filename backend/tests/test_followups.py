@@ -132,3 +132,45 @@ def test_single_floor_buildings_never_ask_about_floors():
     posterior = locator.uniform_room_prior(building.candidate_room, 4)
     plan = followups.choose(model, posterior, building.candidate_room, 4, set(), None)
     assert plan.key != "floor"
+
+
+def make_kitchen_with_three_scans():
+    """One kitchen scanned at three spots: by the stove, by the sink, by the window."""
+    rooms = [{"id": "k", "name": "Kitchen", "types": ["Kitchen"], "floor": 0, "polygon": square(6.0), "walls": []},
+             {"id": "b", "name": "Bedroom", "types": ["Bedroom"], "floor": 0, "polygon": square(4.0), "walls": []}]
+    candidates = [{"views": ["s"], "x": 0.5, "y": 0.5}, {"views": ["k"], "x": 5.5, "y": 0.5},
+                  {"views": ["w"], "x": 3.0, "y": 5.5}, {"views": ["b"], "x": 9.0, "y": 2.0}]
+    building = Building(
+        id="k3", name="k3", address="3 C St", floors=[{"index": 0, "id": "f0", "label": "Floor 1"}], floorplans={},
+        rooms=rooms, candidates=candidates, candidate_room=np.array([0, 0, 0, 1]),
+        has_views=np.array([True, True, True, True]), view_embeddings=np.eye(4, dtype=np.float32),
+        view_candidate=np.array([0, 1, 2, 3]),
+    )
+    scores = {p: np.zeros(4) for p in followups.clip_prompts()}
+    scores[followups.near_prompt("stove")] = np.array([0.30, 0.20, 0.20, 0.20])
+    scores[followups.near_prompt("sink")] = np.array([0.20, 0.30, 0.20, 0.20])
+    scores[followups.near_prompt("window")] = np.array([0.20, 0.20, 0.30, 0.20])
+    model = followups.build_model(building, scores)
+    model.p_yes["window"] = np.full(4, 0.8)   # the kitchen has windows (no CLIP signal in this toy model)
+    return building, model
+
+
+def test_nearest_question_narrows_the_position_inside_the_room():
+    building, model = make_kitchen_with_three_scans()
+    xy = np.array([[c["x"], c["y"]] for c in building.candidates])
+    posterior = np.array([0.33, 0.33, 0.33, 0.01])                     # kitchen known, spot unknown
+    plan = followups.refinement(model, posterior, 0, xy, set())
+    assert plan.kind == "nearest" and {"stove", "sink"} <= set(plan.items)
+    reading = followups.read_message("I'm right by the sink", model, plan, "free")
+    assert reading.likelihood is None                                   # nothing about which room
+    post = locator.apply_within_rooms(posterior, reading.position, building.candidate_room)
+    assert post[1] > 0.6 and np.isclose(post[3], posterior[3] / posterior.sum())   # the bedroom keeps its share
+    none = followups.read_message("none of those", model, plan, "no")
+    assert none.position is not None                                    # "none" is evidence too
+
+
+def test_no_nearest_question_when_position_is_already_tight_or_room_has_one_scan():
+    building, model = make_kitchen_with_three_scans()
+    xy = np.array([[c["x"], c["y"]] for c in building.candidates])
+    assert followups.refinement(model, np.array([0.98, 0.01, 0.0, 0.01]), 0, xy, set()) is None   # tight
+    assert followups.refinement(model, np.array([0.0, 0.0, 0.0, 1.0]), 1, xy, set()) is None      # one scan

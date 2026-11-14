@@ -67,6 +67,10 @@ SKYBOX_RESOLUTION = "low"
 # single vague reply could almost decide alone. 60 lets one distinctive reply dominate while bedrooms (which look
 # alike) still need follow-up questions.
 LOGIT_SCALE = 60.0
+# Sharpness for splitting a room's probability among its own sweeps (locator.update): photo-score differences between
+# sweeps of one room are mostly noise for a room-level description, so they get a quarter of LOGIT_SCALE. Each room's
+# total is computed exactly as before, so room-level results don't change.
+IN_ROOM_LOGIT_SCALE = 15.0
 # A caller naming the room type ("I'm in the bathroom") is strong evidence. At 5x it lost to image noise: a room with
 # many sweeps (the kitchen has 11) always has one that happens to score well against any text.
 ROOM_KEYWORD_BOOST = 20.0
@@ -86,3 +90,13 @@ MIN_INFORMATION_GAIN = 0.05
 FLOOR_ANSWER_ACCURACY = 0.9
 # The floor question goes first while no floor is at least this likely (see followups.choose).
 FLOOR_FIRST_UNTIL = 0.8
+
+# Where in the located room (followups.refinement): at most MAX_REFINEMENTS "what's closest to you?" questions, asked
+# only while the probability-weighted spread of the room's scan points exceeds REFINE_MIN_SPREAD_M (1.5 m: about the
+# spacing of Matterport sweeps, so below it the plan can't be more precise anyway) and the question is worth
+# REFINE_MIN_GAIN bits over scan points. NEAR_SCALE: 1.5 makes a scan point whose close-up score for a landmark is one
+# standard deviation above the room's others ~4x likelier to name it among three offered landmarks.
+MAX_REFINEMENTS = 2
+REFINE_MIN_SPREAD_M = 1.5
+REFINE_MIN_GAIN = 0.15
+NEAR_SCALE = 1.5

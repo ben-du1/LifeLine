@@ -11,6 +11,7 @@ LOCATED_MESSAGE = "Thank you. Responders now know which room you're in ({room}).
 BEST_GUESS_MESSAGE = (
     "Thank you. Responders have your approximate location. Stay where you are and keep your phone with you."
 )
+REFINED_MESSAGE = "Thank you, that helps responders find you. Stay where you are."
 NO_MODEL_MESSAGE = "Thank you. Stay where you are if it is safe; responders are on the way to your address."
 
 
@@ -38,6 +39,14 @@ _UNSURE = re.compile(r"\b(don'?t know|not sure|unsure|idk|can'?t tell|no idea|ma
 class Reply:
     kind: str   # "yes", "no", "unsure", or "free"
     extra: str  # remaining free text ("yes, next to the bed" -> "next to the bed"); full text for "free"
+
+
+# The caller takes back what they said before ("sorry, I'm actually upstairs").
+_CORRECTION = re.compile(r"\b(actually|i meant|i mean|no wait|wait no|correction|scratch that|my mistake)\b|^\s*sorry\b", re.I)
+
+
+def is_correction(text: str) -> bool:
+    return bool(_CORRECTION.search(text))
 
 
 def parse_reply(text: str) -> Reply:

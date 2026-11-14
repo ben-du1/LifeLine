@@ -43,6 +43,7 @@ class Session:
     asked: list[followups.Plan] = field(default_factory=list)   # follow-ups, in the order asked
     pending: followups.Plan | None = None                        # the follow-up awaiting an answer
     covered: set[str] = field(default_factory=set)               # topics settled; never asked about again
+    refined: list[followups.Plan] = field(default_factory=list)  # "what's closest to you?" questions asked
     queued: list[str] = field(default_factory=list)
     estimate: locator.Estimate | None = None
 
@@ -174,15 +175,23 @@ class SessionManager:
             session.queued.append(text)
             await self.notify(session)
             return
-        if session.status != "listening":
-            await self.notify(session)  # recorded, but the location is already decided
+        if session.status not in ("listening", "located", "best_guess"):
+            await self.notify(session)  # no_model / error: recorded only
             return
+        # A located call keeps listening: "actually I'm upstairs" must still move the estimate.
         await self._process(session, text)
 
     async def _process(self, session: Session, text: str) -> None:
         loaded = self.buildings[session.model_id]
         building = loaded.building
+        previous = (session.status, session.estimate.room if session.estimate else None)
         reply = questions.parse_reply(text)
+        if questions.is_correction(text):
+            # "Sorry, I'm actually upstairs": start over from the prior instead of multiplying the correction into
+            # the earlier description. One correction after a confident wrong room (98%) otherwise only got it
+            # down to ~50%. Questions already answered stay counted toward MAX_QUESTIONS.
+            session.posterior = locator.uniform_room_prior(building.candidate_room, len(building.rooms))
+            session.covered.clear()
         cues, semantic = None, None
         if llm.enabled():  # Claude reads paraphrase; None (failure/timeout) falls back to the local reading
             cues = await asyncio.to_thread(llm.read_message, text, session.pending, session.messages,
@@ -193,21 +202,19 @@ class SessionManager:
         room_types = questions.room_types_mentioned(text) | set(cues.room_types if cues else ())
         scores, boost = await asyncio.to_thread(self._evidence, loaded, text, reply, reading.explained, room_types)
         if scores is not None:
-            session.posterior = locator.update(session.posterior, scores, boost)
+            session.posterior = locator.update(session.posterior, scores, boost,
+                                               candidate_room=building.candidate_room)
         if reading.likelihood is not None:
             session.posterior = locator.apply_likelihood(session.posterior, reading.likelihood)
+        if reading.position is not None:
+            session.posterior = locator.apply_within_rooms(session.posterior, reading.position, building.candidate_room)
         session.covered |= reading.covered
         last_kind = session.pending.kind if session.pending else None
         session.pending = None
         session.estimate = self._estimate(session, loaded)
 
         if session.estimate.confident and self._floor_settled(session, loaded):
-            session.status = "located"
-            session.status_detail = "Caller located."
-            room = building.rooms[session.estimate.room]["name"]
-            if len(building.floors) > 1:  # "Kitchen, Floor 2": the floor matters as much as the room upstairs
-                room = f"{room}, {building.floors[int(building.room_floor[session.estimate.room])]['label']}"
-            await self._say(session, questions.LOCATED_MESSAGE.format(room=room))
+            await self._located(session, loaded, previous, last_kind)
             return
         plan = None
         if len(session.asked) < config.MAX_QUESTIONS:
@@ -216,10 +223,14 @@ class SessionManager:
         if plan is None:
             reason = ("Question limit reached" if len(session.asked) >= config.MAX_QUESTIONS
                       else "No follow-up would tell the remaining rooms apart")
-            session.status = "best_guess"
             session.status_detail = f"{reason}. Most likely: {self._leading_rooms(session, loaded)}."
+            if previous[0] == "best_guess":
+                await self.notify(session)  # estimate updated; the caller already got the closing text
+                return
+            session.status = "best_guess"
             await self._say(session, questions.BEST_GUESS_MESSAGE)
             return
+        session.status = "listening"  # also after a correction reopened a located call
         session.asked.append(plan)
         session.pending = plan
         session.status_detail = f"Asked follow-up {len(session.asked)} of {config.MAX_QUESTIONS}."
@@ -252,6 +263,38 @@ class SessionManager:
         if boost is not None:
             return np.zeros(len(building.candidates)), boost
         return None, None
+
+    async def _located(self, session: Session, loaded: LoadedBuilding, previous: tuple, last_kind: str | None) -> None:
+        """The room is known. Tell the caller (once), then narrow down where in the room with up to MAX_REFINEMENTS
+        "what's closest to you?" questions while the room has several scan points and the position is spread out."""
+        building = loaded.building
+        room = session.estimate.room
+        refine = None
+        if len(session.refined) < config.MAX_REFINEMENTS:
+            asked = {k for plan in session.refined for k in plan.items}
+            refine = followups.refinement(loaded.features, session.posterior, room, self._xy(building), asked)
+        newly_located = previous != ("located", room)
+        session.status = "located"
+        session.status_detail = "Caller located." if refine is None else "Caller located; narrowing down where in the room."
+        if refine is not None:
+            session.refined.append(refine)
+            session.pending = refine
+        if newly_located:
+            name = building.rooms[room]["name"]
+            if len(building.floors) > 1:  # "Kitchen, Floor 2": the floor matters as much as the room upstairs
+                name = f"{name}, {building.floors[int(building.room_floor[room])]['label']}"
+            text = questions.LOCATED_MESSAGE.format(room=name)
+            await self._say(session, f"{text} {refine.text}" if refine else text)
+        elif refine is not None:
+            await self._say(session, refine.text)
+        elif last_kind == "nearest":
+            await self._say(session, questions.REFINED_MESSAGE)
+        else:
+            await self.notify(session)  # same room as before: don't repeat the "located" text
+
+    @staticmethod
+    def _xy(building: Building) -> np.ndarray:
+        return np.array([[c["x"], c["y"]] for c in building.candidates], dtype=float)
 
     @staticmethod
     def _floor_settled(session: Session, loaded: LoadedBuilding) -> bool:
@@ -339,12 +382,16 @@ class SessionManager:
         data["candidate_probabilities"] = [float(p) for p in session.posterior]
         est = session.estimate
         if est is not None:
-            candidate = building.candidates[est.candidate]
+            # Where in the room: probability-weighted position of the room's candidates, with its RMS spread as an
+            # uncertainty radius (at least half a sweep spacing, since positions are only known at scan points).
+            members = np.flatnonzero(building.candidate_room == est.room)
+            (x, y), spread = followups.position_spread(session.posterior, self._xy(building), members)
             data["estimate"] = {
                 "room": est.room, "room_name": building.rooms[est.room]["name"], "candidate": est.candidate,
                 "floor": int(building.room_floor[est.room]),
                 "floor_label": floor_labels[int(building.room_floor[est.room])],
-                "x": candidate["x"], "y": candidate["y"], "room_probability": est.room_probability,
+                "x": float(x), "y": float(y), "radius_m": round(max(spread, config.REFINE_MIN_SPREAD_M / 2), 2),
+                "room_probability": est.room_probability,
                 "runner_up_probability": est.runner_up_probability, "confident": est.confident,
             }
         return data

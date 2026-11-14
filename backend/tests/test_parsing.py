@@ -20,3 +20,10 @@ def test_room_types_mentioned():
 
 def test_normalize_phone():
     assert normalize_phone("+1 (609) 555-1234") == normalize_phone("6095551234")
+
+
+def test_is_correction():
+    assert questions.is_correction("sorry, I'm actually upstairs")
+    assert questions.is_correction("no wait, it's the other bathroom")
+    assert not questions.is_correction("there's a sorry looking couch")   # "sorry" only counts at the start
+    assert not questions.is_correction("I'm in the kitchen")

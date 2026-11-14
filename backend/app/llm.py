@@ -133,6 +133,10 @@ def _pending_description(pending: followups.Plan | None) -> str:
     if pending.kind == "choice":
         options = ", ".join(f"{o.key} ({o.label})" for o in pending.options)
         return f"Pending choice question: \"{pending.text}\" Options: {options}."
+    if pending.kind == "nearest":
+        return (f"Pending 'what is closest to you' question: \"{pending.text}\" Landmarks: {', '.join(pending.items)}. "
+                "Report the landmarks the caller says are next to them under 'mentioned' (present = true); "
+                "answer 'none' if they say none of them.")
     if pending.kind == "list":
         return (f"Pending 'which of these' question: \"{pending.text}\" "
                 f"Items: {', '.join(pending.items)}. Report items the caller sees under 'mentioned'.")

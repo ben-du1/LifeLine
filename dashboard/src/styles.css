@@ -171,6 +171,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 .sweep { fill: var(--muted); fill-opacity: 0.55; transition: r 0.4s; }
 .marker-dot { fill: var(--accent); stroke: #fff; stroke-width: 0.08; }
 .marker-pulse { fill: var(--accent); fill-opacity: 0.25; }
+.marker-area { fill: var(--accent); fill-opacity: 0.08; stroke: var(--accent); stroke-opacity: 0.5; stroke-width: 0.05; stroke-dasharray: 0.25 0.15; }
 .marker.located .marker-pulse { animation: pulse 1.6s ease-out infinite; transform-box: fill-box; transform-origin: center; }
 .marker.tentative .marker-dot { fill: var(--warn); }
 .marker.tentative .marker-pulse { fill: var(--warn); }

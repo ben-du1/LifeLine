@@ -101,15 +101,18 @@ export default function FloorPlan({ building, session, floor = 0, showPhoto, sel
         const [cx, cy] = P(c.x, c.y);
         return <circle key={c.id} cx={cx} cy={cy} r={0.12 + 0.35 * Math.sqrt(p)} className="sweep" />;
       })}
-      {showEstimate && <Marker at={P(estimate.x, estimate.y)} located={located} />}
+      {showEstimate && <Marker at={P(estimate.x, estimate.y)} radius={estimate.radius_m} located={located} />}
       {orientation && <Compass x={view.x + 1.6} y={view.y + 1.8} />}
     </svg>
   );
 }
 
-function Marker({ at: [x, y], located }) {
+// The caller's estimated spot, with a circle for how sure the system is about where in the room (RMS spread of the
+// room's scan points, in meters). It shrinks as "what's closest to you?" answers come in.
+function Marker({ at: [x, y], radius, located }) {
   return (
     <g className={located ? "marker located" : "marker tentative"}>
+      {radius > 0 && <circle cx={x} cy={y} r={radius} className="marker-area" />}
       <circle cx={x} cy={y} r="0.9" className="marker-pulse" />
       <circle cx={x} cy={y} r="0.35" className="marker-dot" />
     </g>

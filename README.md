@@ -9,8 +9,9 @@ Built for the CoStar × Matterport track ("Inside and Out: AI for the Built Worl
 |---|---|
 | Core loop (call → texts → room estimate → dot on plan), simulated caller | Working, verified |
 | Address → Matterport model (fuzzy matching) | Working, verified against the live API |
-| Follow-up questions (cues, information gain, paraphrase matching) | Working; scripted eval 15/19 |
+| Follow-up questions (cues, information gain, paraphrase matching) | Working; scripted eval 14/19 top room, 0 confidently wrong |
 | Room photos per call (API + dashboard gallery) | Working, verified |
+| Spot within the room ("what's closest to you?", uncertainty circle) | Working: mean error 3.1 m → 1.0 m on three photo-checked spots; verified in the browser |
 | Photon iMessage (send + receive) | Working, verified with a real phone |
 | Orientation: north-up plan + nearest street (OpenStreetMap) | Working, verified on two houses |
 | Multi-floor buildings | Working, verified: eval 4/4 rooms and floors. In the browser, the floor tabs follow the estimate and the plan switches floors after the caller's answer. |
@@ -46,7 +47,10 @@ text conversation with the caller.
      and step 4 repeats. In a multi-storey building, "Which floor are you on?" comes first while the floor is
      uncertain. It stops with a best guess, marked low-confidence, after `MAX_QUESTIONS` rounds or when no question
      would help.
-6. **Orientation for responders.** The plan is drawn north-up, with the nearest street on the side where it really
+6. **Where in the room.** Once the room is known, the system asks up to two "what's closest to you?" questions, for
+   example "the stove, the sink, or the fireplace?", built from that room's scan points. The dot moves toward the
+   matching spot, with a circle showing how sure it is.
+7. **Orientation for responders.** The plan is drawn north-up, with the nearest street on the side where it really
    is.
 
 ## MVP scope
@@ -135,8 +139,11 @@ Session snapshot fields: `id, phone, address, status, status_detail, model_id`,
 (`role` is `dispatch`, `caller` or `system`), `questions_asked, max_questions`,
 `rooms[{index, name, floor, floor_label, probability}]` (sorted), `floors[{index, label, probability}]`,
 `orientation` (true once north/street data is cached), `candidate_probabilities[]` (aligned with the building's
-`candidates`), and `estimate{room, room_name, floor, floor_label, candidate, x, y, room_probability,
-runner_up_probability, confident}`.
+`candidates`), and `estimate{room, room_name, floor, floor_label, candidate, x, y, radius_m, room_probability,
+runner_up_probability, confident}`. In `estimate`:
+- `x, y` is the probability-weighted position of the top room's scan points.
+- `radius_m` is its uncertainty (RMS spread, at least 0.75 m).
+- `candidate` is the single most likely scan point.
 Statuses: `loading → listening → located | best_guess`, or `no_model` / `error`.
 
 ## Matterport data
@@ -226,13 +233,32 @@ model at a very similar address does exist. The backend therefore picks the mode
 - **Candidates:** one per sweep (plus one per sweep-less room). Each candidate's score for a piece of text is the
   maximum cosine similarity over its 4 views. The caller may be facing any direction.
 - **Prior:** uniform over rooms, split evenly across a room's candidates, so rooms with many sweeps are not favored.
-- **Update:** `posterior ∝ prior × exp(LOGIT_SCALE × (score − max score))`, applied once per reply. Image-less
-  candidates get the median imaged score (`IMAGELESS_SCORE_QUANTILE`, roughly neutral). If the reply names a room
-  type, candidates in rooms with that classification are multiplied by `ROOM_KEYWORD_BOOST`.
+- **Update:** `posterior ∝ prior × exp(LOGIT_SCALE × (score − max score))`, applied once per reply. If the reply
+  names a room type, candidates in rooms with that classification are multiplied by `ROOM_KEYWORD_BOOST`.
+- **Rooms without photos** (`Building.candidate_scores`) start from the median imaged score
+  (`IMAGELESS_SCORE_QUANTILE`, roughly neutral). They are then lifted by how far photographed rooms *of the same
+  type* stand out for the text (mean peer score minus mean imaged score).
+  - **Why:** at 12331 Basilwood Dr the whole upper floor has no photos. Before this, "I'm in the bathroom" was
+    "located" in the one photographed (downstairs) bathroom at 91%, because LOGIT_SCALE turned "has a photo" into
+    ~20× odds. Now the three bathrooms tie and the floor question comes first.
+  - **Mean, not max:** the best of several peers scores high for almost any text, and in the eval that let
+    unphotographed closets and a 2 m² "bedroom" win.
+- **Within a room** (`IN_ROOM_LOGIT_SCALE = 15`): each room's total moves exactly as above, but the room's share is
+  split among its own scan points with a quarter of the sharpness.
+  - **Why:** photo-score differences between sweeps of one room are mostly noise for a room-level description.
+    "I'm in the living room" put 38% on one of eleven sweeps, and the dot started 2–5 m off.
+  - **Rejected alternative:** ranking rooms by their best sweep favoured rooms with many sweeps, and "I'm in a
+    narrow space" was "located" in the big living area instead of the hallway.
 - **Free-text replies** are embedded and scored as above. A reply that only answers our question ("yes", "tile",
   "none of those") is not embedded; its meaning comes from the follow-up model below.
 - **Confidence rule:** the top room's probability ≥ `CONFIDENCE_THRESHOLD` and it leads the runner-up by at least
   `CONFIDENCE_MARGIN`.
+- **After "located", the call keeps listening.** New replies still update the estimate:
+  - If the estimate moves to another room, or confidence drops, the call reopens and asks a follow-up.
+  - If the room stays the same, nothing is re-sent.
+  - An explicit correction ("sorry", "actually", "I meant", "no wait") resets the estimate to the prior before
+    the new reply is applied. Without the reset, one correction after a confident wrong room (98%) only brought it
+    down to ~50%.
 - **Output:** the highest-probability candidate inside the top room; its `(x, y)` (model meters) is drawn on the
   floor plan. The dashboard shows every photo of that room, or of any room the dispatcher clicks.
 - **Current values** (`config.py`): `LOGIT_SCALE=60`, `ROOM_KEYWORD_BOOST=20`, `IMAGELESS_SCORE_QUANTILE=0.5`,
@@ -309,6 +335,34 @@ There is no fixed question list. Each follow-up builds on what the caller has sa
     the floor first, and callers know it.
   - **Located needs the floor too:** "located" also requires the room's floor to be that likely, so "I'm in the
     kitchen" in a building with two kitchens on different floors asks for the floor before declaring a location.
+- **Where in the room** (`followups.refinement`): once the room is "located", the system asks up to
+  `MAX_REFINEMENTS = 2` "what's closest to you?" questions. The conditions:
+  - the room has several photographed scan points;
+  - the position is spread more than `REFINE_MIN_SPREAD_M = 1.5 m`;
+  - the question is worth at least `REFINE_MIN_GAIN = 0.15` bits.
+
+  The first one is appended to the "located" text. How it works:
+  - **Landmarks:** stove, sink, fridge, fireplace, front door, glass door, couch, table, TV, bed, toilet, stairs,
+    and so on, limited to those the room probably has. Each scan point gets a close-up CLIP score
+    ("a close-up photo of the stove"), z-scored across the room's scan points. In the sample house, kitchen items
+    peak at the sweep between the sink, stove and fridge, and the fireplace at the sweep beside it (checked
+    against the photos).
+  - **Choosing the three landmarks:** every combination is scored, and the one with the highest expected
+    information gain over the scan points is asked. Ranking landmarks one at a time picked weak sets (0.13 vs
+    0.65 bits).
+  - **Reading the answer:** each landmark is modelled independently as "right next to you" (`NEAR_SCALE = 1.5`),
+    so naming one, several, or "none of those" are all evidence.
+  - **No effect on the room:** the answer is applied with `locator.apply_within_rooms`, which keeps every room's
+    total. It only moves the dot.
+
+  Results for callers at three photo-checked spots in the sample house's main room, each opening with "I'm in the
+  living room":
+
+  | Spot | Answers | Error before → after | Uncertainty |
+  |---|---|---|---|
+  | By the sink/stove/fridge | "none of those"; "the stove and the sink" | 1.6 m → 0.6 m | ±3.0 → ±1.4 m |
+  | By the fireplace and patio door | "the glass door to outside"; "the fireplace" | 3.7 m → 1.0 m | ±3.0 → ±2.0 m |
+  | By the front door and table | "the table"; "the front door" | 4.0 m → 1.5 m | ±3.0 → ±2.6 m |
 - **Phrasing:** each question starts by acknowledging the last cue: "You said it's a tight space. Can you see a
   sink or faucet?"
 
@@ -350,31 +404,35 @@ against the live API**: no Claude credentials were available. Expect a few secon
 
 `backend/scripts/eval_scenarios.py [-v]` runs scripted callers through the real session flow. Their answers come
 from a fact sheet checked against the photos, and `-v` prints each conversation. Current result, with no API key:
-**15/19**:
-- 11/15 on the single-floor houses, including 3 of 4 open-ended paraphrases that contain no feature keywords.
+**14/19 top room correct, and none confidently wrong**:
+- 10/15 on the single-floor houses, including 3 of 4 open-ended paraphrases that contain no feature keywords.
 - **4/4 rooms and 4/4 floors** on the 4-floor building.
+
+Before the "rooms without photos" fix the score was 15/19, but two of the misses were declared "located" in the
+wrong room. Those cases had won only because their closet was the one with a photo. They now end as an honest best
+guess that lists the similar closets.
 
 It needs the three buildings cached; it ingests them on first run, which takes several minutes.
 
 | Building | Caller is in | Opening | Result |
 |---|---|---|---|
-| Chipman Glen (vacant) | Bedroom 1 | "empty room with a window and a ceiling fan" | Correct, no follow-ups |
+| Chipman Glen (vacant) | Bedroom 1 | "empty room with a window and a ceiling fan" | Correct (best guess, 53%) |
 | Chipman Glen | Bedroom 2 | "empty room with two windows with blinds" | Best guess: Bedroom 3 55%, Bedroom 2 31% (identical empty rooms) |
 | Chipman Glen | Kitchen/living | "I can see a stove and a fridge" | Correct, no follow-ups |
 | Chipman Glen | Kitchen/living | "there's a brick fireplace" | Correct, no follow-ups |
 | Chipman Glen | Bathroom 1 | "I'm in a cramped space" | Best guess: Bathroom 2 58%, Bathroom 1 42% (neither has photos) |
 | Chipman Glen | Hallway | "I'm in a narrow space" | Correct after 3 follow-ups |
-| 7921 Pointer St | Pantry/Laundry | "small room with lots of shelves" | **Wrong:** Closet 4. Labeled laundry, but there is no machine, so a truthful "no washer" counts against it |
-| 7921 Pointer St | Closet 4 | "I'm in a cramped space" | Correct (best guess, 35%) |
+| 7921 Pointer St | Pantry/Laundry | "small room with lots of shelves" | **Wrong:** best guess lists the closets (~33% each). Labeled laundry, but there is no machine, so a truthful "no washer" counts against it |
+| 7921 Pointer St | Closet 4 | "I'm in a cramped space" | **Wrong:** best guess, Closet 4 third (22%) behind two unphotographed closets the caller can't be told apart from |
 | 7921 Pointer St | Bathroom | "it's tiny in here" | Correct after 3 follow-ups |
 | 7921 Pointer St | Kitchen | "I'm next to the stove" | Correct, no follow-ups |
 | 7921 Pointer St | Bedroom 3 | "it's a big room with a bed" | Correct after 1 follow-up |
 | 7921 Pointer St | Kitchen | "I'm right next to where you cook" | Correct, no follow-ups |
 | 7921 Pointer St | Bathroom | "I can barely move, I'm squeezed in by the tub" | Correct after 4 follow-ups |
 | Chipman Glen | Kitchen/living | "the room is massive, there's a brick mantel" | Correct, no follow-ups |
-| 7921 Pointer St | Closet 4 | "I can touch both walls and my coats are hanging next to me" | **Wrong:** Closet 2. Read correctly as a tight closet, but a truthful "no window" counts against Closet 4, whose photo shows the bedroom window through its door |
+| 7921 Pointer St | Closet 4 | "I can touch both walls and my coats are hanging next to me" | **Wrong:** best guess across four closets (Closet 2 28%). Read correctly as a tight closet; a truthful "no window" counts against Closet 4, whose photo shows the bedroom window through its door |
 | 3012 Houston Ave (4 floors) | Office, floor 1 | "I'm downstairs in a room with wood paneling and a bookcase" | Correct, floor 1 at 97%, no follow-ups |
-| 3012 Houston Ave | Game Room, floor 3 | "I'm in an empty room with built-in shelves" | Asked the floor ("3rd floor"), then correct |
+| 3012 Houston Ave | Game Room, floor 3 | "I'm in an empty room with built-in shelves" | Asked the floor ("3rd floor"), then correct after more follow-ups |
 | 3012 Houston Ave | Loft, floor 4 | "I'm on the top floor near the stairs, there's a couch" | Correct, floor 4 at 93%, no follow-ups |
 | 3012 Houston Ave | Kitchen, floor 1 (another on floor 2) | "I'm in the kitchen" | Asked the floor ("ground floor"), then correct |
 
@@ -439,7 +497,7 @@ cd dashboard && npm install && npm run dev        # http://localhost:5173
 cd messaging && npm start                         # no dependencies; the caller's phone must text the shared line first
 ```
 
-Tests: `cd backend && .venv/Scripts/python -m pytest` (39 tests). `test_semantics.py` downloads the ~90 MB
+Tests: `cd backend && .venv/Scripts/python -m pytest` (44 tests). `test_semantics.py` downloads the ~90 MB
 paraphrase model on first run; the rest need no network.
 Scenario check: `cd backend && .venv/Scripts/python scripts/eval_scenarios.py [-v]` (ingests the three test
 buildings on first run).
@@ -453,7 +511,10 @@ buildings on first run).
 3. Answer the follow-ups (yes/no via the quick buttons, or type "tile", "closet-sized", "I see a stove") until the
    dot appears. Try a vague opening like "I'm in a cramped space" to see the follow-ups narrow it down.
 4. Click any room (on the plan or in the probability list) to see all of its photos.
-5. Multi-floor: call `3012 Houston Ave, Houston, TX` and say "I'm in an empty room with built-in shelves". The
+5. Where in the room: in the sample house say "I'm in the living room", then answer the "what's closest to you?"
+   questions ("the glass door to outside", "the fireplace"). The dot moves to the fireplace corner and the circle
+   shrinks.
+6. Multi-floor: call `3012 Houston Ave, Houston, TX` and say "I'm in an empty room with built-in shelves". The
    floor question comes first; answer "3rd floor". Floor tabs above the plan show each floor's probability.
 
 ## Known limitations
@@ -462,7 +523,10 @@ buildings on first run).
 - An approximate address match (e.g. the neighbouring house) is a *different building*. The dashboard flags it, and
   the dispatcher should confirm it with the caller.
 - Address matching is tuned for US street addresses; other formats are untested.
-- Rooms without sweeps can only be chosen by room-type words.
+- The spot within a room is only as fine as the scan points (about 1.5 m apart) and the landmarks in view. It
+  can't place the caller between scan points beyond that, or in rooms without photos.
+- Rooms without photos are scored like the photographed rooms of the same type, so they can't be told apart from
+  each other (or from their photographed sibling) by appearance; floor, size and room-type words separate them.
 - Visually similar rooms (the sample's empty bedrooms) are confused, sometimes with high confidence.
 - Without `ANTHROPIC_API_KEY`, follow-ups use templates, and replies are read by keywords plus paraphrase matching
   against fixed example phrasings. Phrasing far from those examples is only understood through CLIP. The

@@ -16,6 +16,7 @@ Every feature has a model P(yes | candidate) that combines up to three sources (
   - Geometry: room area and shape from the floor plan outline (for size and "long and narrow").
 """
 
+import itertools
 import re
 from dataclasses import dataclass, field
 
@@ -141,12 +142,30 @@ class FeatureModel:
     candidate_room: np.ndarray             # (n_candidates,) index into rooms
     floor_options: tuple = ()              # one Option per floor (lowest first) when the building has 2+ floors
     candidate_floor: np.ndarray | None = None  # (n_candidates,) floor index of each candidate
+    near: dict | None = None               # landmark key -> raw close-up CLIP score per candidate (NaN: no photos)
+
+
+# Landmarks for the in-room "what's closest to you?" question: fixtures a person stands next to, with how they are
+# named to the caller. Their close-up CLIP prompt ("a close-up photo of the stove") scores highest at the scan points
+# standing next to them: in the sample house's main room, kitchen items peaked at the sweep between sink, stove and
+# fridge, and the fireplace at the sweep beside it (checked against the photos).
+NEAR_NAMES = {
+    "stove": "the stove", "fridge": "the fridge", "sink": "the sink", "toilet": "the toilet or tub",
+    "washer": "the washer or dryer", "shelves": "shelves or hanging clothes", "bed": "the bed", "sofa": "the couch",
+    "table": "the table", "tv": "the TV", "fireplace": "the fireplace", "window": "a window", "stairs": "the stairs",
+    "front_door": "the front door", "sliding_door": "the glass door to outside", "mirror": "the mirror",
+}
+
+
+def near_prompt(key: str) -> str:
+    return f"a close-up photo of {NEAR_NAMES[key]}"
 
 
 def clip_prompts() -> list[str]:
     """Every CLIP prompt the model needs, in a fixed order (embedded once per building)."""
     prompts = [f.prompt for f in FEATURES if f.prompt]
     prompts += [o.prompt for c in CHOICES for o in c.options if o.prompt]
+    prompts += [near_prompt(k) for k in NEAR_NAMES]
     return prompts
 
 
@@ -300,7 +319,8 @@ def build_model(building, prompt_scores: dict[str, np.ndarray]) -> FeatureModel:
     floors = floor_options(len(building.floors))
     if floors:
         p_option["floor"] = _floor_likelihoods(building.candidate_floor, len(floors))
-    return FeatureModel(p_yes, p_option, area, cand_room, floors, building.candidate_floor)
+    near = {k: np.where(building.has_views, prompt_scores[near_prompt(k)], np.nan) for k in NEAR_NAMES}
+    return FeatureModel(p_yes, p_option, area, cand_room, floors, building.candidate_floor, near)
 
 
 # ---- planned questions ----------------------------------------------------------------------------------------
@@ -308,11 +328,12 @@ def build_model(building, prompt_scores: dict[str, np.ndarray]) -> FeatureModel:
 
 @dataclass
 class Plan:
-    kind: str                  # "yesno", "choice", or "list"
+    kind: str                  # "yesno", "choice", "list", or "nearest" (where in the located room)
     key: str                   # feature key (yesno), choice key (choice), or "list"
     text: str
     items: tuple[str, ...] = ()  # feature keys offered in a "list" question
     options: tuple = ()          # Options offered in a "choice" question
+    room: int = -1               # the located room, for a "nearest" question
 
 
 def answer_matrix(plan: Plan, model: FeatureModel) -> np.ndarray:
@@ -371,6 +392,86 @@ def choose(model: FeatureModel, posterior: np.ndarray, cand_room: np.ndarray, n_
     return plans[best] if gains[best] >= config.MIN_INFORMATION_GAIN else None
 
 
+# ---- where in the room ----------------------------------------------------------------------------------------
+
+
+def _room_scans(model: FeatureModel, room: int) -> np.ndarray:
+    """Indices of the photographed candidates (scan points) in `room`."""
+    return np.flatnonzero((model.candidate_room == room) & ~np.isnan(model.near["stove"]))
+
+
+def _near_each(model: FeatureModel, items: tuple[str, ...], scans: np.ndarray) -> np.ndarray:
+    """P(item i is right next to the caller | standing at scan s), shape (n_items, n_scans), each item on its own:
+    a sigmoid of its close-up score z-scored across the room's scans. Scans about one standard deviation above the
+    room's average count as "next to it" (NEAR_SCALE sets how sharply)."""
+    raw = np.stack([model.near[k][scans] for k in items])
+    z = (raw - raw.mean(axis=1, keepdims=True)) / (raw.std(axis=1, keepdims=True) + 1e-6)
+    return np.clip(1 / (1 + np.exp(-config.NEAR_SCALE * (z - 1.0))), 0.05, 0.95)
+
+
+def _answer_probs(p: np.ndarray, named: tuple[bool, ...]) -> np.ndarray:
+    """P(caller names exactly the `named` subset of the offered items | scan), from independent per-item p."""
+    out = np.ones(p.shape[1])
+    for pi, said in zip(p, named):
+        out = out * (pi if said else 1 - pi)
+    return out
+
+
+def _nearest_probs(model: FeatureModel, items: tuple[str, ...], scans: np.ndarray) -> np.ndarray:
+    """P(answer | scan) for every possible answer (each subset of the offered items, including "none of those"),
+    shape (2**n_items, n_scans). Used to score how informative a set of landmarks is."""
+    p = _near_each(model, items, scans)
+    return np.stack([_answer_probs(p, named) for named in itertools.product((False, True), repeat=len(items))])
+
+
+def position_spread(posterior: np.ndarray, xy: np.ndarray, members: np.ndarray) -> tuple[np.ndarray, float]:
+    """Probability-weighted position of `members` (candidate indices) and its RMS spread in meters."""
+    w = posterior[members] / posterior[members].sum()
+    center = w @ xy[members]
+    return center, float(np.sqrt(w @ ((xy[members] - center) ** 2).sum(axis=1)))
+
+
+def refinement(model: FeatureModel, posterior: np.ndarray, room: int, xy: np.ndarray,
+               asked: set[str]) -> Plan | None:
+    """A "what's closest to you?" question inside the located room, or None when it can't help: fewer than two
+    scan points, the position already tight (REFINE_MIN_SPREAD_M), or no landmarks that separate the scan points."""
+    scans = _room_scans(model, room)
+    if len(scans) < 2:
+        return None
+    _, spread = position_spread(posterior, xy, scans)
+    if spread < config.REFINE_MIN_SPREAD_M:
+        return None
+    w = posterior[scans] / posterior[scans].sum()
+    # Landmarks this room probably has (presence model), not yet offered.
+    present = [k for k in NEAR_NAMES if k not in asked and model.p_yes[k][scans].mean() >= 0.5]
+    if len(present) < 2:
+        return None
+    # The three landmarks whose answer is expected to tell the likely scan points apart best. Every combination is
+    # scored (at most C(16, 3) = 560): ranking landmarks one by one by how much they vary picked TV/sofa/table
+    # (0.13 bits) where sofa/fireplace/glass door was worth 0.65 bits in the sample house's main room.
+    def gain_of(items):
+        return locator.expected_information_gain(w, _nearest_probs(model, items, scans),
+                                                 np.arange(len(scans)), len(scans))
+    size = min(3, len(present))
+    gain, items = max((gain_of(combo), combo) for combo in itertools.combinations(present, size))
+    if gain < config.REFINE_MIN_GAIN:
+        return None
+    names = [NEAR_NAMES[k] for k in items]
+    listed = f"{names[0]} or {names[1]}" if len(names) == 2 else f"{', '.join(names[:-1])}, or {names[-1]}"
+    text = f"To help responders find you faster: what's closest to you: {listed}?"
+    return Plan("nearest", "nearest", text, items=items, room=room)
+
+
+def nearest_likelihood(model: FeatureModel, plan: Plan, said: list[str]) -> np.ndarray:
+    """Likelihood over candidates from which offered landmarks the caller named as next to them ("none of those"
+    counts too: not next to any of them). Only the located room's scan points are reweighted; everything else is
+    left as is (1), so this never moves the room estimate."""
+    scans = _room_scans(model, plan.room)
+    likelihood = np.ones(len(model.candidate_room))
+    likelihood[scans] = _answer_probs(_near_each(model, plan.items, scans), tuple(k in said for k in plan.items))
+    return likelihood
+
+
 # ---- reading the caller ---------------------------------------------------------------------------------------
 
 
@@ -395,6 +496,7 @@ class Reading:
     covered: set[str]                    # feature/choice keys this message settled (don't ask about them again)
     acknowledgement: str
     explained: bool
+    position: np.ndarray | None = None   # in-room likelihood from a "closest" answer (apply with apply_within_rooms)
 
 
 def _mentioned(feature: Feature, text: str) -> str | None:
@@ -455,7 +557,7 @@ def _keyword_cues(text: str, pending: Plan | None, reply_kind: str) -> Cues:
         elif pending.kind == "choice":
             cues.options = tuple(o.key for o in pending.options if re.search(o.words, text, re.I))
             cues.explained = bool(cues.options) and short <= 4
-        elif pending.kind == "list" and (reply_kind == "no" or re.search(r"\b(none|nothing|neither)\b", text, re.I)):
+        elif pending.kind in ("list", "nearest") and (reply_kind == "no" or re.search(r"\b(none|nothing|neither)\b", text, re.I)):
             cues.answer, cues.explained = "none", short <= 4
 
     for feature in FEATURES:
@@ -481,6 +583,7 @@ def _keyword_cues(text: str, pending: Plan | None, reply_kind: str) -> Cues:
 def apply_cues(cues: Cues, model: FeatureModel, pending: Plan | None) -> Reading:
     """Turn cues into one likelihood over candidates."""
     likelihood = None
+    position = None
     covered: set[str] = set()
 
     def apply(values: np.ndarray) -> None:
@@ -505,6 +608,11 @@ def apply_cues(cues: Cues, model: FeatureModel, pending: Plan | None) -> Reading
             for key in pending.items:
                 apply(1 - model.p_yes[key])
                 covered.add(key)
+        elif pending.kind == "nearest":
+            said = [k for k in pending.items if cues.mentioned.get(k) == "yes"]
+            if said or cues.answer in ("none", "no"):
+                position = nearest_likelihood(model, pending, said)
+            covered.update(pending.items)  # named landmarks are about position here, not room presence
 
     # 2. Features mentioned anywhere in the message ("there's a toilet", "no windows").
     for key, said in cues.mentioned.items():
@@ -534,7 +642,7 @@ def apply_cues(cues: Cues, model: FeatureModel, pending: Plan | None) -> Reading
         apply(1 - model.p_yes["window"])
         covered.add("window")
 
-    return Reading(likelihood, covered, cues.acknowledgement, cues.explained)
+    return Reading(likelihood, covered, cues.acknowledgement, cues.explained, position)
 
 
 def read_message(text: str, model: FeatureModel, pending: Plan | None, reply_kind: str,

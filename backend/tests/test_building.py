@@ -69,3 +69,19 @@ def test_ingest_keeps_every_floor_and_handles_unlabeled_regions(tmp_path, monkey
     monkeypatch.setattr(matterport, "fetch_model", lambda model_id: empty)
     with pytest.raises(ingest.UnusableModel):
         ingest.download_building("m")
+
+
+def test_unphotographed_rooms_borrow_the_score_of_photographed_rooms_of_the_same_type():
+    # Bathroom A was photographed; bathroom B (another floor) and a bedroom were not.
+    rooms = [{"id": "a", "types": ["Bathroom"]}, {"id": "b", "types": ["Bathroom"]}, {"id": "c", "types": ["Bedroom"]},
+             {"id": "k", "types": ["Kitchen"]}]
+    b = Building(
+        id="m", name="m", address="1 A St", floors=[{"index": 0, "id": "f0", "label": "Floor 1"}], floorplans={},
+        rooms=rooms, candidates=[{"views": ["a"]}, {"views": []}, {"views": []}, {"views": ["k"]}],
+        candidate_room=np.array([0, 1, 2, 3]), has_views=np.array([True, False, False, True]),
+        view_embeddings=np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32), view_candidate=np.array([0, 3]),
+    )
+    scores = b.candidate_scores(np.array([0.9, 0.1], dtype=np.float32))   # "a bathroom" matches the bathroom photo
+    neutral = np.quantile(scores[[0, 3]], 0.5)
+    assert scores[1] > neutral             # lifted toward the photographed bathroom, which stands out for this text
+    assert scores[2] == neutral            # no photographed bedroom: neutral

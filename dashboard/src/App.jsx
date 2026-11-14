@@ -181,7 +181,7 @@ function SessionView({ session, building, config }) {
             <span>
               Top room <strong>{estimate.room_name}</strong>
               {multiFloor ? ` (${estimate.floor_label})` : ""} {pct(estimate.room_probability)} (next{" "}
-              {pct(estimate.runner_up_probability)})
+              {pct(estimate.runner_up_probability)}) · spot ±{estimate.radius_m?.toFixed(1)} m
             </span>
           )}
         </div>
@@ -313,7 +313,9 @@ function RoomPhotos({ session, roomIndex, followsEstimate, onFollowEstimate }) {
         room.sweeps.map((sweep, i) => (
           <div key={sweep.candidate} className="sweep-shots">
             <span className="muted">
-              Scan point {i + 1} of {room.sweeps.length}
+              {i === 0 && followsEstimate && room.sweeps.length > 1
+                ? `Most likely spot (${pct(liveScan(session, sweep.candidate))})`
+                : `Scan point ${i + 1} of ${room.sweeps.length}`}
             </span>
             <div className="view-strip">
               {sweep.views.map((url) => (
@@ -351,6 +353,9 @@ function FloorTabs({ floors, shown, estimateFloor, followsEstimate, onPick }) {
     </div>
   );
 }
+
+// Live probability of one scan point (the photos list is fetched once; probabilities change every reply).
+const liveScan = (session, candidate) => session.candidate_probabilities?.[candidate] ?? 0;
 
 // Which Matterport property the call is using. A non-exact match is highlighted so the dispatcher confirms it.
 function MatchNote({ session }) {

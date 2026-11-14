@@ -2,11 +2,15 @@
 
 import json
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 
 import numpy as np
 
 from . import config
+
+# Room types too vague to say two rooms look alike.
+GENERIC_ROOM_TYPES = {"other", "room", "unknown"}
 
 
 @dataclass
@@ -56,15 +60,44 @@ class Building:
         py = fp["height"] - (y - fp["origin"]["y"]) * fp["resolution"]
         return px, py
 
+    @cached_property
+    def same_type_peers(self) -> list[np.ndarray]:
+        """For each image-less candidate, the photographed candidates in rooms of the same type (e.g. the one
+        photographed bathroom for an unphotographed upstairs bathroom); empty arrays for imaged candidates."""
+        types = [{t.lower() for t in r.get("types", [])} - GENERIC_ROOM_TYPES for r in self.rooms]
+        imaged = np.flatnonzero(self.has_views)
+        peers = []
+        for c in range(len(self.candidates)):
+            mine = types[self.candidate_room[c]]
+            if self.has_views[c] or not mine:
+                peers.append(np.empty(0, dtype=np.int64))
+            else:
+                peers.append(imaged[[bool(mine & types[self.candidate_room[i]]) for i in imaged]])
+        return peers
+
     def candidate_scores(self, text_embedding: np.ndarray) -> np.ndarray:
         """Per-candidate match score for one text: the best cosine similarity over that candidate's views (the caller
-        may be facing any direction). Image-less candidates get a fixed quantile of the imaged scores (see
-        config.IMAGELESS_SCORE_QUANTILE) so they stay roughly neutral."""
+        may be facing any direction).
+
+        Image-less candidates (rooms that were never photographed) start from a neutral score, a fixed quantile of
+        the imaged scores (config.IMAGELESS_SCORE_QUANTILE), plus how far photographed rooms of the same type stand
+        out for this text (mean peer score minus mean imaged score): an unphotographed bathroom is assumed to look
+        like the photographed bathrooms.
+        - Without the lift, the single photographed bathroom won every bathroom description by ~20x (LOGIT_SCALE),
+          so at 12331 Basilwood Dr, whose whole upper floor has no photos, "I'm in the bathroom" was "located" in
+          the downstairs bathroom.
+        - The peer *mean* is used, not the max: the best of several peers scores high for almost any text, and in
+          the scripted eval that let unphotographed closets and a 2 m² "bedroom" beat the photographed room the
+          caller was in.
+        Rooms with no photographed peer (or no label) keep the neutral score."""
         sims = self.view_embeddings @ text_embedding
         scores = np.full(len(self.candidates), -np.inf, dtype=np.float32)
         np.maximum.at(scores, self.view_candidate, sims)
-        if self.has_views.any():
-            scores[~self.has_views] = np.quantile(scores[self.has_views], config.IMAGELESS_SCORE_QUANTILE)
-        else:
-            scores[:] = 0.0
+        if not self.has_views.any():
+            return np.zeros(len(self.candidates), dtype=np.float32)
+        imaged = scores[self.has_views]
+        neutral = np.quantile(imaged, config.IMAGELESS_SCORE_QUANTILE)
+        for c in np.flatnonzero(~self.has_views):
+            peers = self.same_type_peers[c]
+            scores[c] = neutral + (scores[peers].mean() - imaged.mean()) if len(peers) else neutral
         return scores

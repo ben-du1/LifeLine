@@ -58,13 +58,39 @@ class Building:
 
     def candidate_scores(self, text_embedding: np.ndarray) -> np.ndarray:
         """Per-candidate match score for one text: the best cosine similarity over that candidate's views (the caller
-        may be facing any direction). Image-less candidates get a fixed quantile of the imaged scores (see
-        config.IMAGELESS_SCORE_QUANTILE) so they stay roughly neutral."""
+        may be facing any direction). Image-less candidates borrow the score of photographed rooms of the same type (see
+        imageless_peers), or else a fixed quantile of the imaged scores (config.IMAGELESS_SCORE_QUANTILE), roughly
+        neutral."""
         sims = self.view_embeddings @ text_embedding
         scores = np.full(len(self.candidates), -np.inf, dtype=np.float32)
         np.maximum.at(scores, self.view_candidate, sims)
         if self.has_views.any():
-            scores[~self.has_views] = np.quantile(scores[self.has_views], config.IMAGELESS_SCORE_QUANTILE)
+            fallback = np.quantile(scores[self.has_views], config.IMAGELESS_SCORE_QUANTILE)
+            for c, groups in self.imageless_peers().items():
+                scores[c] = np.mean([_room_score(scores[g]) for g in groups]) if groups else fallback
         else:
             scores[:] = 0.0
         return scores
+
+    def imageless_peers(self) -> dict[int, list[np.ndarray]]:
+        """For each image-less candidate: the imaged candidates of every *other* room that shares a room type with its
+        room, one index array per room. A caller who says "toilet" is as likely in a photo-less bathroom as in the
+        photographed one, so the photo-less one borrows that room's evidence instead of the house-wide median (which
+        let the photographed bathroom take ~100%). Empty when no room of the same type has photos (or the room has
+        no types), in which case the median is used as before."""
+        room_types = [{t.lower() for t in r.get("types") or []} for r in self.rooms]
+        imaged_rooms = {int(r): np.flatnonzero(self.has_views & (self.candidate_room == r))
+                        for r in np.unique(self.candidate_room[self.has_views])}
+        peers = {}
+        for c in np.flatnonzero(~self.has_views):
+            room = int(self.candidate_room[c])
+            peers[int(c)] = [g for r, g in imaged_rooms.items() if r != room and room_types[room] & room_types[r]]
+        return peers
+
+
+def _room_score(scores: np.ndarray, scale: float = config.LOGIT_SCALE) -> float:
+    """One score standing for a whole room's candidates: the log-mean-exp at the update's logit scale, so that
+    exp(scale × this) equals the room's average likelihood under the uniform-per-room prior (locator.update). A plain
+    mean would understate a room with many sweeps (one of them usually matches well); the max would overstate it."""
+    top = float(scores.max())
+    return top + float(np.log(np.mean(np.exp(scale * (scores - top))))) / scale

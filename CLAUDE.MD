@@ -19,7 +19,7 @@ changes.
   - `locator.py`: pure-numpy Bayesian update.
   - `ingest.py`: Matterport download into the `data/` cache.
   - `config.py`: every tunable value, each with a comment explaining it. Read that comment before changing a value.
-- `backend/tests/`: pytest. `backend/scripts/eval_scenarios.py`: scripted callers, the accuracy check (15/19 now).
+- `backend/tests/`: pytest. `backend/scripts/eval_scenarios.py`: scripted callers, the accuracy check (15/19; every miss is a best guess, none a confident wrong room).
 - `dashboard/`: React + Vite; `src/App.jsx` and `src/FloorPlan.jsx` (SVG plan, north-up, floor-aware).
 - `messaging/`: Node sidecar for Photon's Beta REST API (no npm dependencies).
 - `data/buildings/<model_id>/`: downloaded interiors and embeddings (gitignored; Matterport content is licensed
@@ -31,7 +31,7 @@ changes.
   `.venv/Scripts/python` can fail ("No module named app" or exit 127). Use
   `/c/Users/ben/desktop/coding/hackprinecton-mvp/backend/.venv/Scripts/python` and `cd` into `backend/` in the same
   command.
-- **Tests:** `cd backend && .venv/Scripts/python -m pytest -q` (39 tests, ~35 s).
+- **Tests:** `cd backend && .venv/Scripts/python -m pytest -q` (279 tests; `tests/fakes.py` runs the real SessionManager offline with a fake CLIP).
 - **Eval:** `cd backend && MESSAGING_MODE=simulated .venv/Scripts/python scripts/eval_scenarios.py -v`. It is slow
   the first time, because it ingests 3 buildings.
 - **Backend:** `cd backend && .venv/Scripts/python -m uvicorn app.main:app --port 8000`.
@@ -59,8 +59,9 @@ changes.
   replies and words questions, but never chooses them. It has never run live (no key yet).
 - **Orientation:** the plan is north-up from Matterport's geocoordinates yaw, plus the nearest street from
   OpenStreetMap Nominatim.
-  - **Vexcel overlay:** removed by the user's request, because the floor plan didn't line up exactly with the
-    imagery. `VEXCEL_API_KEY` may still be in `.env`, but it is unused.
+  - **Vexcel overlay on the plan:** removed by the user's request, because the floor plan didn't line up exactly
+    with the imagery. Vexcel is now used in the separate Map view (`geo.py` `/aerial`, `MapView.jsx`), with manual
+    nudge controls for the few-meter offset; `VEXCEL_API_KEY` in `.env` turns it on.
   - **Overpass:** too unreliable; it timed out or reported "at capacity" on every attempt.
   - **CoStar:** not used; its extract has no roads or imagery.
 - **Photon:** the project is on Photon Beta (`pho_prj_…`, `pho_sk_…`). The `spectrum-ts` SDK rejects Beta ids,

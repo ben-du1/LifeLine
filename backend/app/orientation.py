@@ -40,6 +40,25 @@ def load(model_id: str) -> dict | None:
     return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
 
 
+# ---- Matterport geocoordinates, cached (also read by geo.py for the map view and aerial imagery) ----------------
+
+def geo_path(model_id: str):
+    return ingest.building_dir(model_id) / "geo.json"
+
+
+def cached_geo(model_id: str) -> dict | None:
+    """matterport.fetch_geo, cached in data/buildings/<id>/geo.json: the transform never changes for a model, and
+    both the street lookup and the map view need it, so it costs one GraphQL call per building. A model without
+    geolocation (None) is not cached, so a later retry can still find one. Raises MatterportError / httpx errors."""
+    p = geo_path(model_id)
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
+    geo = matterport.fetch_geo(model_id)
+    if geo is not None:
+        p.write_text(json.dumps(geo, indent=1), encoding="utf-8")
+    return geo
+
+
 def model_to_enu(geo: dict, xy: np.ndarray) -> np.ndarray:
     """Model meters (N, 2) -> east/north meters around (lat, lon)."""
     c, s = math.cos(geo["yaw"]), math.sin(geo["yaw"])
@@ -98,7 +117,7 @@ def street_from_nominatim(result: dict, center_lonlat: tuple[float, float]) -> d
 
 def fetch(model_id: str) -> dict:
     building = json.loads((ingest.building_dir(model_id) / "building.json").read_text(encoding="utf-8"))
-    geo = matterport.fetch_geo(model_id)
+    geo = cached_geo(model_id)
     if geo is None:
         raise ValueError("Matterport has no geolocation for this model")
     # The house center: middle of the scanned rooms, moved onto the map.

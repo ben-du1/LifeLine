@@ -57,8 +57,9 @@ def test_follow_up_after_cramped_targets_small_rooms():
     posterior = locator.apply_likelihood(locator.uniform_room_prior(building.candidate_room, 4), reading.likelihood)
     plan = followups.choose(model, posterior, building.candidate_room, 4, reading.covered, None)
     asked_about = set(plan.items) if plan.kind == "list" else {plan.key}
-    # The follow-up must be about something that separates a closet from a bathroom, not about size again.
-    assert asked_about & {"toilet", "sink", "mirror", "shelves"} and "size" not in asked_about
+    # The follow-up must be about something that separates a closet from a bathroom, not about size again. Flooring
+    # qualifies: bathrooms are essentially never carpeted (followups._NEVER_CARPETED).
+    assert asked_about & {"toilet", "sink", "mirror", "shelves", "flooring"} and "size" not in asked_about
     assert followups.phrase(plan, reading.acknowledgement).startswith("You said it's a tight space.")
 
 
@@ -132,3 +133,65 @@ def test_single_floor_buildings_never_ask_about_floors():
     posterior = locator.uniform_room_prior(building.candidate_room, 4)
     plan = followups.choose(model, posterior, building.candidate_room, 4, set(), None)
     assert plan.key != "floor"
+
+
+# ---- calibrated CLIP presence (contrast against neutral prompts) -----------------------------------------------
+
+WINDOW = followups.FEATURES_BY_KEY["window"].prompt  # no room types, so p_yes is CLIP alone
+WASHER = followups.FEATURES_BY_KEY["washer"].prompt
+
+
+def contrast_scores(feature_scores: dict[str, list[float]]) -> dict[str, np.ndarray]:
+    """Per-candidate raw scores: every prompt at 0.20 (the neutral level) unless given; ensemble phrasings copy their
+    original prompt."""
+    scores = {p: np.full(4, 0.20) for p in followups.clip_prompts()}
+    for prompt, values in feature_scores.items():
+        for p in followups._ensemble(prompt):
+            scores[p] = np.array(values)
+    return scores
+
+
+def test_feature_absent_everywhere_is_unlikely_everywhere(monkeypatch):
+    monkeypatch.setattr(followups.config, "CLIP_CALIBRATED", True)
+    building, _ = make_model()
+    # Below or tied with the neutral prompts in every imaged room: the old z-score called the best of them ~0.8.
+    scores = contrast_scores({WINDOW: [0.18, 0.20, 0.20, 0.17], WASHER: [0.19, 0.20, 0.16, 0.20]})
+    model = followups.build_model(building, scores)
+    for key in ("window", "washer"):
+        assert model.p_yes[key][building.has_views].max() < 0.3, key  # photo-less rooms have no CLIP evidence
+
+
+def test_feature_present_in_one_room_is_likely_there_only(monkeypatch):
+    monkeypatch.setattr(followups.config, "CLIP_CALIBRATED", True)
+    building, _ = make_model()
+    model = followups.build_model(building, contrast_scores({WINDOW: [0.18, 0.20, 0.19, 0.28]}))
+    p = model.p_yes["window"]
+    assert p[3] > 0.8 and p[[0, 2]].max() < 0.3
+    assert p[1] == 0.5  # the photo-less bathroom has no CLIP evidence and no room type for windows
+
+
+def test_without_baseline_prompts_clip_presence_stays_relative():
+    building, _ = make_model()
+    raw = np.array([0.18, 0.20, 0.19, 0.28])
+    scores = {p: raw for p in followups.clip_prompts() if p not in followups.BASELINE_PROMPTS}
+    p = followups.build_model(building, scores).p_yes["window"]
+    imaged = raw[[0, 2, 3]]
+    expected = followups._sigmoid(1.5 * (imaged - imaged.mean()) / (imaged.std() + 1e-6))
+    assert np.allclose(p[[0, 2, 3]], np.clip(expected, 0.05, 0.95))
+
+
+def test_view_contrast_ignores_a_cluttered_view(monkeypatch):
+    """Per-view baseline: a busy face that scores high against every prompt (neutral ones too) doesn't look like a
+    window, while a face where only the window prompt is high does. One-hot view embeddings make each prompt
+    vector's entries its per-view cosines."""
+    monkeypatch.setattr(followups.config, "CLIP_CALIBRATED", True)
+    building, _ = make_model()
+    building.view_embeddings = np.eye(4, dtype=np.float32)
+    building.view_candidate = np.array([0, 0, 2, 3])  # closet has a plain and a cluttered face
+    vectors = {p: np.array([0.20, 0.30, 0.20, 0.20]) for p in followups.clip_prompts()}  # face 1 is cluttered
+    for p in followups._ensemble(WINDOW):
+        vectors[p] = np.array([0.19, 0.31, 0.19, 0.28])  # window only in the kitchen (face 3)
+    contrast = followups.view_contrast(building, vectors)
+    scores = {p: building.candidate_scores(v) for p, v in vectors.items()}
+    p = followups.build_model(building, scores, contrast).p_yes["window"]
+    assert p[3] > 0.8 and p[0] < 0.3 and p[2] < 0.3

@@ -30,6 +30,8 @@ SYSTEM = (
     "the caller actually says; never guess or add details. Messages may be terse, misspelled or panicked."
 )
 
+_FLOORING_KEYS = [o.key for o in followups.CHOICES_BY_KEY["flooring"].options]
+
 READ_SCHEMA = {
     "type": "object",
     "properties": {
@@ -44,6 +46,9 @@ READ_SCHEMA = {
             "properties": {"feature": {"type": "string", "enum": [f.key for f in followups.FEATURES]},
                            "present": {"type": "boolean"}},
             "required": ["feature", "present"], "additionalProperties": False}},
+        "flooring": {"type": "array", "items": {"type": "string", "enum": _FLOORING_KEYS},
+                     "description": "Floor materials the caller describes when no flooring question is pending "
+                                    "('carpeted floor' -> carpet). Empty if not said."},
         "size": {"type": "string", "enum": ["tight", "small", "medium", "large", "unknown"]},
         "dark": {"type": "boolean"},
         "room_types": {"type": "array", "items": {"type": "string", "enum": ROOM_TYPES}},
@@ -56,8 +61,8 @@ READ_SCHEMA = {
         "explained": {"type": "boolean",
                       "description": "True if the message only answers the pending question and adds nothing."},
     },
-    "required": ["answer", "options", "mentioned", "size", "dark", "room_types", "floors", "acknowledgement",
-                 "explained"],
+    "required": ["answer", "options", "mentioned", "flooring", "size", "dark", "room_types", "floors",
+                 "acknowledgement", "explained"],
     "additionalProperties": False,
 }
 
@@ -136,6 +141,10 @@ def _pending_description(pending: followups.Plan | None) -> str:
     if pending.kind == "list":
         return (f"Pending 'which of these' question: \"{pending.text}\" "
                 f"Items: {', '.join(pending.items)}. Report items the caller sees under 'mentioned'.")
+    if pending.kind == "near":
+        return (f"Pending 'which are you closest to' question: \"{pending.text}\" "
+                f"Items: {', '.join(pending.items)}. Report the item(s) the caller says they are closest to under "
+                "'mentioned' as present; answer 'none' if they are near none of them, 'unsure' if they don't know.")
     return f"Pending yes/no question about '{pending.key}': \"{pending.text}\""
 
 
@@ -157,18 +166,23 @@ def read_message(text: str, pending: followups.Plan | None, messages: list[dict]
     try:
         allowed = {o.key for o in pending.options} if pending is not None and pending.kind == "choice" else set()
         answer = data["answer"] if data["answer"] != "not_answered" else None
+        flooring = (tuple(k for k in data.get("flooring", []) if k in _FLOORING_KEYS)  # .get: may be omitted
+                    if not (pending is not None and pending.key == "flooring") else ())  # that answer is in options
         return followups.Cues(
             answer=answer if pending is not None else None,
             options=tuple(k for k in data["options"] if k in allowed),
             mentioned={m["feature"]: "yes" if m["present"] else "no" for m in data["mentioned"]
                        if m["feature"] in followups.FEATURES_BY_KEY},
+            flooring=flooring,
             size=None if data["size"] == "unknown" else data["size"],
             dark=bool(data["dark"]),
             room_types=tuple(t for t in data["room_types"] if t in ROOM_TYPES),
             floors=tuple(n - 1 for n in data["floors"] if isinstance(n, int) and 1 <= n <= n_floors)
             if n_floors > 1 else (),
             acknowledgement=data["acknowledgement"].strip()[:120],
-            explained=bool(data["explained"]),
+            # A bare floor description has nothing else for the free-text CLIP match, whose floor matching is
+            # unreliable (a concrete garage scores as "carpet"), whatever Claude said.
+            explained=bool(data["explained"]) or (bool(flooring) and followups.only_floor_words(text)),
         )
     except (KeyError, TypeError, AttributeError) as exc:
         log.warning("Claude output did not match the schema (%s); using keyword rules", exc)
@@ -179,6 +193,8 @@ def _required_words(plan: followups.Plan) -> list[str]:
     """Words the question must contain so the caller's answer still maps onto the planned topic."""
     if plan.kind == "choice":
         return [o.label.split("-")[0].split()[0] for o in plan.options]
+    if plan.kind == "near":
+        return [followups._near_noun(k).removeprefix("the ").split()[0] for k in plan.items]
     if plan.kind == "list":
         return [followups.FEATURES_BY_KEY[k].noun.removeprefix("a ").removeprefix("the ").split()[0].strip(",")
                 for k in plan.items]
@@ -189,9 +205,14 @@ def phrase_question(plan: followups.Plan, messages: list[dict], acknowledgement:
     """Word the planned follow-up around what the caller said. None (use the template) if the result is unusable."""
     if plan.kind == "yesno":
         topic = f"a yes/no question: whether there is {followups.FEATURES_BY_KEY[plan.key].noun}"
+    elif plan.kind == "position":  # where the room is (adjacency.py): keep the planned wording's meaning
+        topic = f"this yes/no question about where their room is, in plain words: \"{plan.text}\""
     elif plan.kind == "choice":
         labels = ", ".join(o.label for o in plan.options)
         topic = f"which of these describes the room ({plan.key}): {labels}. Offer exactly these options"
+    elif plan.kind == "near":
+        nouns = ", ".join(followups._near_noun(k) for k in plan.items)
+        topic = f"which of these they are closest to: {nouns}. Name all of them"
     else:
         nouns = ", ".join(followups.FEATURES_BY_KEY[k].noun for k in plan.items)
         topic = f"which of these they can see: {nouns}. Name all of them"

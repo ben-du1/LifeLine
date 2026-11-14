@@ -9,13 +9,16 @@ Built for the CoStar × Matterport track ("Inside and Out: AI for the Built Worl
 |---|---|
 | Core loop (call → texts → room estimate → dot on plan), simulated caller | Working, verified |
 | Address → Matterport model (fuzzy matching) | Working, verified against the live API |
-| Follow-up questions (cues, information gain, paraphrase matching) | Working; scripted eval 15/19 |
+| Follow-up questions (cues, information gain, paraphrase matching) | Working; scripted eval 15/19, no confidently wrong rooms |
 | Room photos per call (API + dashboard gallery) | Working, verified |
 | Photon iMessage (send + receive) | Working, verified with a real phone |
 | Orientation: north-up plan + nearest street (OpenStreetMap) | Working, verified on two houses |
 | Multi-floor buildings | Working, verified: eval 4/4 rooms and floors. In the browser, the floor tabs follow the estimate and the plan switches floors after the caller's answer. |
 | Optional Claude layer (`llm.py`) | Written and unit-tested with a stub; **never run live** (no key) |
+| Where inside a big room (`subroom.py`: region + zone label, up to 2 within-room questions) | Unit-tested on a synthetic building; within-room questions wait for `followups.choose_within_room`; not run on a real model |
+| Demo preflight (`scripts/preflight_demo.py`) + "Demo buildings" menu (`/api/demo`) | Written; unit-tested on a synthetic cache and dry-run with stubs. **Not yet run against the live API** |
 | Vexcel aerial overlay | Tried and removed (see "Orientation"). CoStar data: not used. |
+| Map view data: GeoJSON rooms + Vexcel aerial photo (`geo.py`) | Written and tested with mocked Matterport/Vexcel; **never run live** |
 
 ## Problem
 
@@ -107,19 +110,25 @@ Sessions are kept in memory in the backend (restarting the backend clears them).
 | `embeddings.py` | Wraps the open_clip model (image and text encoders). |
 | `locator.py`    | Pure-numpy belief update, confidence rule, and expected information gain. |
 | `followups.py`  | Reads cues from the caller's words; feature model (CLIP + room labels + geometry + floors); plans follow-ups. |
+| `adjacency.py`  | Shared walls between rooms and street-facing rooms, from the floor plan; "position" follow-ups ("next to the kitchen?"). |
+| `ties.py`       | Rooms that are tied with the leader and look alike, named together to the dispatcher. |
 | `semantics.py`  | Local paraphrase matching of caller messages (sentence embeddings). |
 | `orientation.py`| North-up heading (Matterport) and the nearest street (OpenStreetMap Nominatim) for the floor plan. |
+| `geo.py`        | Rooms, outline and sweeps in lon/lat (GeoJSON) for a map view; optional Vexcel aerial photo around the house. |
 | `llm.py`        | Optional Claude reading of replies and wording of follow-ups (falls back to keyword rules). |
 | `questions.py`  | Opening/closing messages and reply parsing (yes / no / free text / unsure). |
+| `subroom.py`    | Where inside a big room: in-room region (centroid + radius) and a zone label ("kitchen end, near the stove"). |
 | `sessions.py`   | Session state machine and conversation flow. |
 | `messaging.py`  | Outbound messages: `simulated` (dashboard only) or `photon` (via the sidecar). |
+| `demo.py`       | Demo building list (`demo_buildings.json`) and its cache readiness, for `/api/demo` and `scripts/preflight_demo.py`. |
 | `main.py`       | FastAPI routes, WebSocket broadcast, static files for cached building assets. |
 
 ### API
 
 | Method | Path                           | Body / notes |
 |--------|--------------------------------|--------------|
-| GET    | `/api/config`                  | `{messaging_mode, dev_test_phone, max_questions, followups}` for the dashboard |
+| GET    | `/api/config`                  | `{messaging_mode, dev_test_phone, max_questions, followups, google_maps_key, aerial}` for the dashboard, plus `google_maps_api_key` when set (a browser key) |
+| GET    | `/api/demo`                    | Demo buildings from `demo_buildings.json`, ready first: `[{address, label, note, model_id, ready, cached, orientation, match_score, problems[], score?}]`. Cache only (no network); `score` only if `compat.py` exists |
 | POST   | `/api/calls`                   | `{phone, address}`: simulated 911 call; creates a session |
 | GET    | `/api/sessions`                | All sessions (snapshots) |
 | GET    | `/api/sessions/{id}`           | One session snapshot |
@@ -128,15 +137,20 @@ Sessions are kept in memory in the backend (restarting the backend clears them).
 | POST   | `/api/inbound`                 | `{from, text}`: real caller reply, posted by the messaging sidecar |
 | WS     | `/ws`                          | Pushes `{type: "session", session}` on every change |
 | GET    | `/api/buildings/{model_id}`    | Cached `building.json` (`floors`, `floorplans` per floor, rooms with `floor`/walls/polygon/centroid, candidates) with asset URLs, plus `orientation` (`yaw_deg`, `street{name, distance_m, bearing_deg, side, direction_deg}`) once fetched |
-| GET    | `/buildings/{model_id}/...`    | Cached floorplan and view images |
+| GET    | `/api/buildings/{model_id}/geo`    | GeoJSON `FeatureCollection` of rooms (`properties{kind:"room", index, name, floor, types}`) and the building outline (`kind:"building"`), plus `center{lat, lon}`, `yaw_deg`, `candidates[{candidate, lat, lon, room, floor}]`, `bounds[[s, w], [n, e]]`. 404 if not loaded or no geolocation |
+| GET    | `/api/buildings/{model_id}/aerial` | `{url, bounds[[s, w], [n, e]], source:"Vexcel"}`, or 404 with the reason (no key, outside coverage, error) |
+| GET    | `/buildings/{model_id}/...`    | Cached floorplan, view and aerial images |
 
 Session snapshot fields: `id, phone, address, status, status_detail, model_id`,
 `match{id, name, address, score, exact}` (the Matterport property in use), `messages[{role, text, ts}]`
 (`role` is `dispatch`, `caller` or `system`), `questions_asked, max_questions`,
-`rooms[{index, name, floor, floor_label, probability}]` (sorted), `floors[{index, label, probability}]`,
+`rooms[{index, name, floor, floor_label, probability, has_photos, types, area_m2}]` (sorted), `floors[{index, label, probability}]`,
 `orientation` (true once north/street data is cached), `candidate_probabilities[]` (aligned with the building's
 `candidates`), and `estimate{room, room_name, floor, floor_label, candidate, x, y, room_probability,
-runner_up_probability, confident}`.
+runner_up_probability, confident}`, and `tie_group[{index, name, probability}]` (rooms that can't be told apart
+from the leading one, leader first; empty when there is no tie, see `ties.py`),
+`evidence[{ts, text, top_before, changes[{name, delta}]}]` (last 20
+caller messages: the top-3 room probability changes each caused, shown under the message on the dashboard).
 Statuses: `loading → listening → located | best_guess`, or `no_model` / `error`.
 
 ## Matterport data
@@ -226,16 +240,29 @@ model at a very similar address does exist. The backend therefore picks the mode
 - **Candidates:** one per sweep (plus one per sweep-less room). Each candidate's score for a piece of text is the
   maximum cosine similarity over its 4 views. The caller may be facing any direction.
 - **Prior:** uniform over rooms, split evenly across a room's candidates, so rooms with many sweeps are not favored.
-- **Update:** `posterior ∝ prior × exp(LOGIT_SCALE × (score − max score))`, applied once per reply. Image-less
-  candidates get the median imaged score (`IMAGELESS_SCORE_QUANTILE`, roughly neutral). If the reply names a room
+- **Update:** `posterior ∝ prior × L`, applied once per reply (`locator.clip_likelihood`). Per room, `L` is
+  `exp(LOGIT_SCALE × (best sweep score − spread × expected max of N draws))`, where spread is the scores' robust (MAD)
+  spread and N the room's sweep count, so a room with many sweeps isn't favored for one lucky view. It is clipped so no
+  room gets more than `CLIP_MAX_LIKELIHOOD_RATIO` (4x) another's: photos alone can't locate a caller in one message.
+  Inside a room, sweeps are reweighted by `exp(LOGIT_SCALE × score)` without changing the room's total. Image-less
+  candidates borrow the score of photographed rooms that share their room type (log-mean-exp of each such room's
+  sweeps, averaged over those rooms), so a photo-less bathroom and a photographed one split "there's a toilet" evenly;
+  the follow-up model's CLIP presence is imputed the same way. With no photographed room of the same type they get
+  the median imaged score (`IMAGELESS_SCORE_QUANTILE`, roughly neutral). If the reply names a room
   type, candidates in rooms with that classification are multiplied by `ROOM_KEYWORD_BOOST`.
 - **Free-text replies** are embedded and scored as above. A reply that only answers our question ("yes", "tile",
   "none of those") is not embedded; its meaning comes from the follow-up model below.
 - **Confidence rule:** the top room's probability ≥ `CONFIDENCE_THRESHOLD` and it leads the runner-up by at least
-  `CONFIDENCE_MARGIN`.
+  `CONFIDENCE_MARGIN`. "Located" also needs (`locator.is_located`): no room of the same type with at least
+  `SIBLING_RATIO` × the leader's probability (identical bedrooms), and at least `MIN_EVIDENCE_MESSAGES` caller
+  messages that carried evidence, unless one message named the only room of its type or a feature only it has ("I'm in
+  the kitchen" in a one-kitchen house). Short only of evidence, the best follow-up is asked even if its expected gain is
+  below `MIN_INFORMATION_GAIN`.
+- **Posterior floor:** after each evidence-bearing message, `POSTERIOR_FLOOR` (2%) of the uniform-room prior is mixed
+  back in, so no room shows 0% or 100% and a later contradicting answer can still win.
 - **Output:** the highest-probability candidate inside the top room; its `(x, y)` (model meters) is drawn on the
   floor plan. The dashboard shows every photo of that room, or of any room the dispatcher clicks.
-- **Current values** (`config.py`): `LOGIT_SCALE=60`, `ROOM_KEYWORD_BOOST=20`, `IMAGELESS_SCORE_QUANTILE=0.5`,
+- **Current values** (`config.py`): `LOGIT_SCALE=60`, `CLIP_MAX_LIKELIHOOD_RATIO=4`, `ROOM_KEYWORD_BOOST=20`, `IMAGELESS_SCORE_QUANTILE=0.5`,
   `CONFIDENCE_THRESHOLD=0.6`, `CONFIDENCE_MARGIN=0.25`, `MAX_QUESTIONS=6`, `MIN_INFORMATION_GAIN=0.05`. The comments
   in `config.py` say why.
 
@@ -271,6 +298,34 @@ Both match the aerial imagery. At Pointer St, the scanned "Front Porch" sits on 
 - **OSM spelling:** street names come from OSM and can differ from the address. OSM has "Chapman Glen Drive" where
   the address says "Chipman Glen Dr".
 
+### Map view data and aerial imagery (`geo.py`)
+
+The same transform, plus a local meters-per-degree scale, puts every room, sweep and a convex-hull building outline
+in lon/lat (`/api/buildings/{id}/geo`). Matterport's raw geocoordinates are cached in
+`data/buildings/<id>/geo.json`, shared with `orientation.py`, so they cost one GraphQL call per building.
+
+With `VEXCEL_API_KEY` set, the backend also clips one Vexcel orthophoto (7.5 cm/px, `AERIAL_SIZE_M` = 110 m square,
+1400 px) around the house after orientation loads, in the background, and caches it as `aerial.jpg` +
+`aerial.json` (bounds). Hackathon keys cover Houston and Los Angeles only; elsewhere Vexcel answers 403, logged
+once, and the endpoint returns 404 with the reason. The photo is approach context (street, driveway, neighbours):
+the few-meter position error that ruled out the old plan-on-roof overlay still applies, so the rooms are not
+claimed to sit exactly on the roof.
+### Approach card (`approach.py`, `ApproachCard.jsx`)
+
+Under the plan, the dashboard says which side of the building and which floor the caller is on, in words for
+responders outside: "2nd floor, rear (north) side, away from Pointer Street. Caller's room has an outside wall on the
+north side, about 4 m from its east end."
+
+- **Outside walls:** per floor, a room's wall is shared where another room on that floor is right behind it (a
+  parallel wall within 0.45 m, the wall thickness, or a point 0.6 m outside it inside that room's outline). The rest
+  is the building outline. An interior room says so and names the nearest outside wall and its distance.
+- **Side and street:** the chosen wall's outward normal is turned into a compass bearing with the model's yaw; it is
+  "front" within 60° of the street's bearing and "rear" beyond 120°.
+- **Street View:** a keyless Google Maps link from ~18 m outside the wall, looking at it. This needs the model's
+  geolocation, cached in `geo.json` next to `orientation.json`. If `GOOGLE_MAPS_API_KEY` is set, the card also shows
+  a Street View Static image; that key is visible to the browser, so restrict it.
+- The text the caller receives is unchanged; the dispatcher's status line adds "Approach: rear (north) side, ...".
+
 ## Follow-up questions (`followups.py`)
 
 There is no fixed question list. Each follow-up builds on what the caller has said so far.
@@ -284,19 +339,43 @@ There is no fixed question list. Each follow-up builds on what the caller has sa
   - **Room names:** as before, named room types boost matching rooms.
 - **Feature model:** each feature (toilet, shelves, washer, stove, narrow shape, and so on) has a probability
   P(present | candidate), averaged from:
-  - **CLIP:** the candidate's photos against the feature prompt, z-scored and passed through a sigmoid.
+  - **CLIP:** the candidate's photos against 3 phrasings of the feature, minus neutral prompts ("an empty room",
+    "a white wall", ...) in the same view, best view per candidate, through a fixed logistic and nudged by the
+    old z-score rank. A feature absent from the whole building now reads as absent everywhere. Constants in
+    `config.py` (`CLIP_CONTRAST_*`) are reasoned, not yet measured on real CLIP; `CLIP_CALIBRATED=0` reverts.
   - **Room label:** Matterport's classification or label, counted double. A toilet implies a bathroom, which lets
     rooms *without photos* be found.
   - **Geometry:** floor area for size questions; bounding-box aspect ratio for "long and narrow".
+  - **Commonsense guard** (`commonsense.py`): a room-type × feature table (typical / possible / implausible) bounds
+    the result, so CLIP can't put a toilet in a garage or a bed in a kitchen (implausible ≤ 0.08, typical ≥ 0.6;
+    also carpet in a garage, a "bigger" closet). Unrecognised room labels ("Room 1") get no bounds.
 - **Question kinds:**
   - **Yes/no:** "Is there a washing machine or dryer?"
-  - **Choice:** "What is the floor like: carpet, tile, or wood?" and "About how big is the room: closet-sized,
-    bedroom-sized, or bigger?" (answered from geometry).
+  - **Choice:** "What is the floor like: carpet, tile, wood, or concrete?" and "About how big is the room:
+    closet-sized, bedroom-sized, or bigger?" (answered from geometry). For flooring, a room type that rules a
+    material out (carpet in a garage, bathroom, kitchen or laundry) overrides CLIP, which confuses grey concrete with
+    carpet. Floor materials named unprompted ("carpeted floor") count as the same answer, and a message that is only
+    a floor description skips the free-text CLIP match.
   - **Which of these:** a list built from the three features that best separate the rooms still in play, e.g.
     "What can you see around you: shelves or hanging clothes, a washer or dryer, or a toilet, tub or shower?"
 - **Choosing:** the question with the highest expected information gain about the *room*
   (`locator.expected_information_gain`) is asked. Topics the caller already settled (mentioned, answered, or
   "I don't know") are never asked again. A "which of these" list is not asked twice in a row.
+- **Position questions (`adjacency.py`):** when the remaining rooms look alike, i.e. no content question is worth
+  `POSITION_ONLY_BELOW_GAIN` (0.15 bits), questions about *where* the room is join the candidates:
+  - **"Is the room you're in next to the kitchen, sharing a wall or a doorway?"**: two rooms on a floor are neighbours
+    when their outlines run parallel within `ADJACENCY_WALL_GAP_M` (0.4 m) for at least `ADJACENCY_MIN_SHARED_M`
+    (0.5 m). Only rooms with a name that is unique in the building are used as the reference ("the kitchen", never
+    "Bedroom 2").
+  - **"Is the room at the front of the house, on the <street> side?"**: once orientation is known, the street's
+    bearing is rotated into model meters; a room is at the front if part of its street-facing outline has no room in
+    front of it (ray cast) and is within `FRONT_MAX_SETBACK_M` (3 m) of the house's street-side edge.
+  - Answers are soft, 0.85 / 0.15 like the room-label prior. Unit-tested on synthetic houses only; not yet run on a
+    real model's walls.
+- **Ties (`ties.py`):** a room is tied with the leader when it is at least half as likely and has the same room type
+  or a near-identical feature profile, and the tied rooms hold at least half the belief. The best-guess (or located)
+  detail then reads "Bathroom 1 or Bathroom 2 (58% / 42%), can't tell apart yet", and a system note tells the
+  dispatcher to check each. The caller's message is unchanged.
 - **Stopping:** if no question is worth `MIN_INFORMATION_GAIN` (0.05 bits), the call stops with a best guess that
   lists the leading rooms, instead of asking irrelevant questions.
 - **Floors (multi-storey buildings):**
@@ -353,6 +432,9 @@ from a fact sheet checked against the photos, and `-v` prints each conversation.
 **15/19**:
 - 11/15 on the single-floor houses, including 3 of 4 open-ended paraphrases that contain no feature keywords.
 - **4/4 rooms and 4/4 floors** on the 4-floor building.
+- Since the Nov 14 reliability changes (re-run on the real API that day): all 4 misses end as a best guess naming
+  the candidates; none is a confidently wrong "located" (the earlier code located Closet 4 and Closet 2 wrongly).
+  More calls take 4-6 follow-ups before deciding. The per-scenario table below predates these changes.
 
 It needs the three buildings cached; it ingests them on first run, which takes several minutes.
 
@@ -439,13 +521,22 @@ cd dashboard && npm install && npm run dev        # http://localhost:5173
 cd messaging && npm start                         # no dependencies; the caller's phone must text the shared line first
 ```
 
-Tests: `cd backend && .venv/Scripts/python -m pytest` (39 tests). `test_semantics.py` downloads the ~90 MB
+Tests: `cd backend && .venv/Scripts/python -m pytest` (279 tests). `test_semantics.py` downloads the ~90 MB
 paraphrase model on first run; the rest need no network.
 Scenario check: `cd backend && .venv/Scripts/python scripts/eval_scenarios.py [-v]` (ingests the three test
 buildings on first run).
 
 ## Demo script
 
+0. **Preflight (the night before, and again on the morning of the demo, on the laptop with the `.env` keys):**
+   `cd backend && .venv/Scripts/python scripts/preflight_demo.py`. For every building in the repo-root
+   `demo_buildings.json` it resolves the address the way a call does, ingests the model if the cache is missing or
+   stale (minutes per building, once), fetches orientation, runs two scripted caller messages through the real call
+   flow, and prints a READY / NOT READY table with timings (exit code 0 only if all are READY). Messaging is forced to
+   `simulated`, so it never texts anyone. `--only Chipman` checks one building; `--no-self-test` skips the scripted
+   call. Add a building by appending `{address, label, model_id, note, self_test, expect_room}` to the JSON file.
+   On the dashboard, the **Demo buildings** menu above the address fills it in (✓ cached, ⚠ not cached; a
+   not-cached choice warns that the first call will take a few minutes to load).
 1. Open the dashboard and enter a phone number and `13122 Chipman Glen Dr, Houston, TX`.
 2. As the caller (simulated box, or a real phone in `photon` mode), describe the room. The sample house is empty,
    so describe fixtures: "there's a brick fireplace and a big window" (living area) or "I can see a stove and a
@@ -468,7 +559,8 @@ buildings on first run).
   against fixed example phrasings. Phrasing far from those examples is only understood through CLIP. The
   optional Claude layer is untested live.
 - Room-label associations (toilet → bathroom, washer → laundry) are assumptions; a mislabeled room or a laundry
-  room without a machine misleads them.
+  room without a machine misleads them. The commonsense guard trusts labels too: in a room mislabeled "Garage", a
+  real toilet is capped at 0.08 per answer (not ruled out).
 - `LOGIT_SCALE` and the confidence values in `config.py` were hand-tuned on the sample model, not calibrated.
 - Sessions live in memory; restarting the backend clears them.
 - Photon's shared iMessage line can't start a conversation: a caller must text it first (see Messaging).

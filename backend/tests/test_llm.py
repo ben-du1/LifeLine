@@ -71,10 +71,10 @@ def test_failures_fall_back_to_none(monkeypatch):
 
 
 def test_phrased_question_must_keep_the_options(monkeypatch):
-    plan = followups.Plan("choice", "flooring", "What is the floor like: carpet, tile, or wood?",
+    plan = followups.Plan("choice", "flooring", "What is the floor like: carpet, tile, wood, or concrete?",
                           options=followups.CHOICES_BY_KEY["flooring"].options)
-    use_stub(monkeypatch, payload={"question": "Okay, it's tight. Is the floor carpet, tile, or wood?"})
-    assert llm.phrase_question(plan, [], "") == "Okay, it's tight. Is the floor carpet, tile, or wood?"
+    use_stub(monkeypatch, payload={"question": "Okay, it's tight. Is the floor carpet, tile, wood, or concrete?"})
+    assert llm.phrase_question(plan, [], "") == "Okay, it's tight. Is the floor carpet, tile, wood, or concrete?"
     use_stub(monkeypatch, payload={"question": "Is the floor soft?"})   # dropped the options -> template
     assert llm.phrase_question(plan, [], "") is None
     use_stub(monkeypatch, payload={"question": "Tell me about the floor."})  # not a question

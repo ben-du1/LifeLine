@@ -1,45 +1,83 @@
+/* Caller Locator: a dispatcher's console for finding someone inside a building.
+ *
+ * The look borrows from fire-department pre-incident plans: a building drawn in blue-black ink on gridded drafting
+ * paper, with red kept for one thing only, the caller. Amber marks anything the system isn't sure about yet.
+ * Public Sans (the US government's typeface) carries the interface; Barlow Condensed, cut from highway signage,
+ * is used for the few things a dispatcher must read from across the room: the room, the floor, the side. */
+
 :root {
-  --bg: #f4f5f7;
-  --surface: #ffffff;
-  --border: #dde1e7;
-  --text: #1c2330;
-  --muted: #667085;
-  --accent: #c8102e;      /* emergency red: estimate marker and primary actions */
-  --accent-soft: #fde8eb;
-  --room: #2f6fde;        /* room probability shading */
-  --wall: #3a4250;
-  --ok: #157f3d;
-  --warn: #b25e09;
-  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  color: var(--text);
+  --paper: #e9edf0;       /* drafting paper: the page */
+  --sheet: #f8fafb;       /* a sheet laid on it: panels */
+  --grid: #dfe5ea;        /* drafting grid under the plan */
+  --ink: #1b2836;         /* blue-black drawing ink: text and walls */
+  --graphite: #5b6875;    /* secondary text */
+  --rule: #c9d2da;        /* hairlines between things */
+  --plan: #2a5c8a;        /* pre-plan blue: room probability shading and bars */
+  --signal: #c41e2c;      /* the caller: marker, located, the call button */
+  --signal-wash: #f6e3e5;
+  --caution: #a8690f;     /* not sure yet: ties, best guesses, tentative marker */
+  --caution-wash: #f5ead7;
+  --clear: #1f6f45;       /* located, live connection */
+
+  /* Names the components already use. */
+  --bg: var(--paper);
+  --surface: var(--sheet);
+  --border: var(--rule);
+  --text: var(--ink);
+  --muted: var(--graphite);
+  --accent: var(--signal);
+  --accent-soft: var(--signal-wash);
+  --room: var(--plan);
+  --wall: var(--ink);
+  --ok: var(--clear);
+  --warn: var(--caution);
+  --region: var(--signal);
+  --region-fill: 0.1;
+
+  --sans: "Public Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --sign: "Barlow Condensed", "Arial Narrow", var(--sans);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.45;
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
 }
 
 @media (prefers-color-scheme: dark) {
+  /* Night shift: the same drawing on a dark blueprint-board, not a generic black. */
   :root {
-    --bg: #12151b;
-    --surface: #1b2029;
-    --border: #2c3340;
-    --text: #e6e9ef;
-    --muted: #98a2b3;
-    --accent: #ff4d5e;
-    --accent-soft: #3a1a20;
-    --room: #5b8ff0;
-    --wall: #c9d1dd;
-    --ok: #4ccb7a;
-    --warn: #f0a24b;
+    --paper: #141c25;
+    --sheet: #1a2430;
+    --grid: #22303d;
+    --ink: #e4eaf0;
+    --graphite: #9aa8b5;
+    --rule: #2f3d4b;
+    --plan: #6fa3d6;
+    --signal: #ff5a5f;
+    --signal-wash: #3a1f25;
+    --caution: #e2a23d;
+    --caution-wash: #3a2d16;
+    --clear: #5fc58f;
+    --region-fill: 0.16;
   }
 }
 
 * { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); }
-h1, h2, h3 { margin: 0; }
-h2 { font-size: 0.95rem; }
-h3 { font-size: 0.85rem; color: var(--muted); font-weight: 600; }
-button, input { font: inherit; color: inherit; }
+body { margin: 0; background: var(--paper); }
+h1, h2, h3, p { margin: 0; }
+h2 { font-size: 0.95rem; font-weight: 600; letter-spacing: -0.005em; }
+h3 { font-size: 0.9rem; font-weight: 600; }
+button, input, select { font: inherit; color: inherit; }
+.muted { color: var(--graphite); font-size: 0.87rem; }
+.error { color: var(--signal); font-size: 0.87rem; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+:focus-visible { outline: 2px solid var(--plan); outline-offset: 2px; }
+
+/* ---- frame ---------------------------------------------------------------------------------------------------- */
 
 .app {
   display: grid;
-  grid-template-columns: 300px 1fr;
+  grid-template-columns: 280px minmax(0, 1fr);
   grid-template-rows: auto 1fr;
   min-height: 100vh;
 }
@@ -49,176 +87,314 @@ button, input { font: inherit; color: inherit; }
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 12px 20px;
-  background: var(--surface);
-  border-bottom: 1px solid var(--border);
+  padding: 10px 24px;
+  background: var(--ink);
+  color: var(--sheet);
 }
-.topbar h1 { font-size: 1.1rem; }
-.topbar-meta { display: flex; gap: 10px; align-items: center; font-size: 0.85rem; }
-.badge { padding: 2px 8px; border: 1px solid var(--border); border-radius: 999px; }
-.conn::before { content: "●"; margin-right: 4px; }
-.conn.on { color: var(--ok); }
-.conn.off { color: var(--warn); }
+.topbar h1 { font-family: var(--sign); font-weight: 600; font-size: 1.45rem; letter-spacing: 0.01em; }
+.conn { display: inline-flex; align-items: center; gap: 7px; font-size: 0.85rem; }
+.conn::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.conn.on { color: #7fd6a4; }
+.conn.off { color: #f0b85a; }
 
 .sidebar {
-  padding: 16px;
-  border-right: 1px solid var(--border);
-  background: var(--surface);
+  padding: 22px 20px;
+  border-right: 1px solid var(--rule);
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 18px;
 }
-.call-form { display: flex; flex-direction: column; gap: 10px; }
-.call-form label { display: flex; flex-direction: column; gap: 4px; font-size: 0.85rem; color: var(--muted); }
-input {
-  padding: 8px 10px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--bg);
+.side-title { font-size: 0.95rem; }
+.side-foot { margin-top: auto; font-size: 0.8rem; color: var(--graphite); line-height: 1.5; }
+
+/* ---- controls ------------------------------------------------------------------------------------------------- */
+
+.call-form { display: flex; flex-direction: column; gap: 12px; }
+.call-form label { display: flex; flex-direction: column; gap: 5px; font-size: 0.82rem; color: var(--graphite); font-weight: 500; }
+input, select {
+  padding: 9px 11px;
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  background: var(--sheet);
+  color: var(--ink);
 }
+input::placeholder { color: var(--graphite); opacity: 0.75; }
+input:focus, select:focus { border-color: var(--plan); outline: none; box-shadow: 0 0 0 3px color-mix(in srgb, var(--plan) 18%, transparent); }
+.demo-warning { color: var(--caution); font-size: 0.8rem; font-weight: 600; }
+
 button {
   padding: 8px 12px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  background: var(--sheet);
   cursor: pointer;
 }
-button:disabled { opacity: 0.5; cursor: default; }
-button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
-.error { color: var(--accent); font-size: 0.85rem; margin: 0; }
-.muted { color: var(--muted); font-size: 0.85rem; }
+button:hover:not(:disabled) { border-color: var(--graphite); }
+button:disabled { opacity: 0.45; cursor: default; }
+button.primary { background: var(--signal); border-color: var(--signal); color: #fff; font-weight: 600; }
+button.primary:hover:not(:disabled) { background: color-mix(in srgb, var(--signal) 88%, #000); border-color: transparent; }
+button.link { border: none; background: none; padding: 0; color: var(--plan); font-size: 0.82rem; text-decoration: underline; text-underline-offset: 2px; }
 
-.session-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
-.session { width: 100%; text-align: left; display: flex; flex-direction: column; gap: 4px; }
-.session.active { border-color: var(--accent); background: var(--accent-soft); }
-.session-address { font-weight: 600; font-size: 0.9rem; }
-.session-meta { font-size: 0.8rem; color: var(--muted); }
-
-.pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 0.75rem; font-weight: 600; }
-.pill-loading, .pill-listening { background: #e8effc; color: #1f4fb0; }
-.pill-located { background: #e3f5ea; color: var(--ok); }
-.pill-best_guess { background: #fdf0e1; color: var(--warn); }
-.pill-no_model, .pill-error { background: var(--accent-soft); color: var(--accent); }
-@media (prefers-color-scheme: dark) {
-  .pill-loading, .pill-listening { background: #1d2c4a; color: #9dbcff; }
-  .pill-located { background: #173322; }
-  .pill-best_guess { background: #3a2a14; }
+/* Calls: a plain list, the open one marked by a red edge. */
+.session-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.session {
+  width: 100%;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: none;
+  border-left: 3px solid transparent;
+  border-radius: 0;
+  background: transparent;
 }
+.session:hover:not(:disabled) { background: color-mix(in srgb, var(--sheet) 60%, transparent); }
+.session.active { border-left-color: var(--signal); background: var(--sheet); }
+.session-address { font-weight: 600; font-size: 0.9rem; line-height: 1.3; }
+.session-meta { display: flex; justify-content: space-between; gap: 8px; font-size: 0.8rem; color: var(--graphite); }
 
-.main { padding: 16px; min-width: 0; }
-.empty { color: var(--muted); padding: 40px; text-align: center; }
+/* Status: a coloured square and a word, not a pill. */
+.pill { display: inline-flex; align-items: center; gap: 6px; font-size: 0.8rem; font-weight: 600; }
+.pill::before { content: ""; width: 8px; height: 8px; border-radius: 1px; background: currentColor; }
+.pill-loading, .pill-listening { color: var(--plan); }
+.pill-located { color: var(--clear); }
+.pill-best_guess { color: var(--caution); }
+.pill-no_model, .pill-error { color: var(--signal); }
+
+/* ---- the call ------------------------------------------------------------------------------------------------- */
+
+.main { padding: 20px 24px 28px; min-width: 0; }
+.empty { color: var(--graphite); padding: 80px 20px; text-align: center; }
 
 .session-view {
   display: grid;
-  grid-template-columns: minmax(0, 1.6fr) minmax(300px, 1fr);
+  grid-template-columns: minmax(0, 1.65fr) minmax(320px, 1fr);
   grid-template-areas:
-    "status status"
+    "incident incident"
     "plan conversation"
     "plan rooms";
-  gap: 14px;
+  grid-template-rows: auto auto 1fr;
+  gap: 18px 20px;
+  align-items: start;
 }
-.status-bar {
-  grid-area: status;
-  display: flex;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 8px;
-  padding: 10px 14px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  font-size: 0.9rem;
-}
-.status-detail { margin-left: 8px; color: var(--muted); }
-.status-numbers { display: flex; gap: 16px; color: var(--muted); }
-.status-numbers strong { color: var(--text); }
 
+/* The answer, first and large: which room, which floor, how sure. */
+.incident {
+  grid-area: incident;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 10px 32px;
+  padding: 2px 0 16px;
+  border-bottom: 2px solid var(--ink);
+}
+.incident-where { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.incident-room {
+  font-family: var(--sign);
+  font-weight: 600;
+  font-size: 2.6rem;
+  line-height: 1.02;
+  letter-spacing: -0.005em;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 16px;
+}
+.incident-none { color: var(--graphite); font-weight: 500; }
+.incident-floor { color: var(--signal); }
+.incident-zone { font-size: 0.95rem; color: var(--graphite); }
+.incident-located .incident-room { color: var(--ink); }
+.incident-numbers { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
+.incident-odds { display: flex; align-items: baseline; gap: 10px; }
+.incident-pct { font-family: var(--sign); font-weight: 600; font-size: 2rem; line-height: 1; font-variant-numeric: tabular-nums; }
+.check-first { flex-basis: 100%; font-size: 0.95rem; color: var(--caution); font-weight: 600; }
+.check-first strong { color: var(--ink); }
+
+.ticks { display: flex; align-items: center; gap: 4px; }
+.tick { width: 18px; height: 5px; border-radius: 1px; background: var(--rule); }
+.tick.on { background: var(--ink); }
+.ticks-text { margin-left: 8px; font-size: 0.8rem; color: var(--graphite); font-variant-numeric: tabular-nums; }
+
+/* Confidence word next to a number. */
+.conf { font-size: 0.78rem; font-weight: 700; }
+.conf-located { color: var(--clear); }
+.conf-likely { color: var(--clear); }
+.conf-possible { color: var(--caution); }
+.conf-unsure { color: var(--graphite); }
+
+/* Sheets: the plan is the drawing; the thread and the ranking are lighter sheets beside it. */
 .panel {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 14px;
+  background: var(--sheet);
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  padding: 16px 18px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 12px;
   min-width: 0;
 }
-.plan-panel { grid-area: plan; }
+.plan-panel { grid-area: plan; border-color: color-mix(in srgb, var(--ink) 35%, var(--rule)); }
 .conversation-panel { grid-area: conversation; }
 .rooms-panel { grid-area: rooms; }
-.panel-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
-.match { margin: 2px 0 0; font-size: 0.8rem; }
-.match-exact { color: var(--ok); }
-.match-approx { color: var(--warn); font-weight: 600; }
-.toggle { font-size: 0.85rem; color: var(--muted); display: flex; gap: 6px; align-items: center; }
+.panel-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+.panel-head h2 { font-size: 1.05rem; }
+.match { margin-top: 3px; font-size: 0.82rem; }
+.match-exact { color: var(--graphite); }
+.match-approx { color: var(--caution); font-weight: 600; }
+.panel-tools { display: flex; gap: 14px; align-items: center; flex: none; }
+.toggle { font-size: 0.85rem; color: var(--graphite); display: flex; gap: 6px; align-items: center; }
+.toggle input { padding: 0; }
 
-.floorplan { width: 100%; height: auto; max-height: 62vh; background: var(--bg); border-radius: 6px; }
-.plan-placeholder { padding: 60px 20px; text-align: center; color: var(--muted); background: var(--bg); border-radius: 6px; }
-.wall { stroke: var(--wall); stroke-width: 0.08; stroke-linecap: round; }
-.room-fill { fill: var(--room); stroke: none; transition: fill-opacity 0.4s; }
-.room-fill { cursor: pointer; }
-.room-fill[data-top] { stroke: var(--room); stroke-width: 0.12; }
-.room-fill[data-selected] { stroke: var(--accent); stroke-width: 0.14; stroke-dasharray: 0.3 0.15; }
-.room-label { pointer-events: none; }
-/* Orientation: north arrow and the nearest street (OpenStreetMap). */
-.compass circle { fill: var(--surface); stroke: var(--border); stroke-width: 0.06; }
-.compass path { fill: var(--accent); }
-.compass text { font-size: 0.6px; font-weight: 700; text-anchor: middle; fill: var(--text); }
-.street-band { stroke: var(--muted); stroke-opacity: 0.35; stroke-width: 1.6; stroke-linecap: round; }
-.street-label { font-size: 0.5px; font-weight: 600; text-anchor: middle; dominant-baseline: middle; fill: var(--text); }
-.room-label { font-size: 0.42px; text-anchor: middle; fill: var(--text); paint-order: stroke; stroke: var(--surface); stroke-width: 0.08px; }
-.room-prob { font-weight: 700; }
-.sweep { fill: var(--muted); fill-opacity: 0.55; transition: r 0.4s; }
-.marker-dot { fill: var(--accent); stroke: #fff; stroke-width: 0.08; }
-.marker-pulse { fill: var(--accent); fill-opacity: 0.25; }
+.segmented { display: inline-flex; }
+.segmented button { padding: 5px 12px; font-size: 0.85rem; border-radius: 0; margin-left: -1px; }
+.segmented button:first-child { border-radius: 3px 0 0 3px; margin-left: 0; }
+.segmented button:last-child { border-radius: 0 3px 3px 0; }
+.segmented button.active { background: var(--ink); border-color: var(--ink); color: var(--sheet); font-weight: 600; position: relative; }
+
+/* ---- the plan --------------------------------------------------------------------------------------------------- */
+
+.floorplan {
+  width: 100%;
+  height: auto;
+  max-height: 64vh;
+  border: 1px solid var(--rule);
+  background-color: var(--sheet);
+  background-image:
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 22px 22px;
+}
+.plan-placeholder { padding: 70px 20px; text-align: center; color: var(--graphite); border: 1px dashed var(--rule); }
+.wall { stroke: var(--ink); stroke-width: 0.09; stroke-linecap: square; }
+.room-fill { fill: var(--plan); stroke: none; cursor: pointer; transition: fill-opacity 0.4s; }
+.room-fill[data-top] { stroke: var(--plan); stroke-width: 0.12; }
+.room-fill[data-selected] { stroke: var(--ink); stroke-width: 0.14; stroke-dasharray: 0.3 0.15; }
+.room-fill[data-tied] { stroke: var(--caution); stroke-width: 0.16; stroke-dasharray: 0.35 0.2; }
+.room-label { pointer-events: none; font-size: 0.42px; text-anchor: middle; fill: var(--ink); font-weight: 500;
+  paint-order: stroke; stroke: var(--sheet); stroke-width: 0.1px; }
+.room-prob { font-weight: 700; font-variant-numeric: tabular-nums; }
+.sweep { fill: var(--graphite); fill-opacity: 0.45; transition: r 0.4s; }
+
+.compass circle { fill: var(--sheet); stroke: var(--ink); stroke-width: 0.05; }
+.compass path { fill: var(--signal); }
+.compass text { font-size: 0.6px; font-weight: 700; text-anchor: middle; fill: var(--ink); }
+.street-band { stroke: var(--graphite); stroke-opacity: 0.22; stroke-width: 1.6; stroke-linecap: butt; }
+.street-label { font-size: 0.48px; font-weight: 600; text-anchor: middle; dominant-baseline: middle; fill: var(--ink); }
+
+.marker-dot { fill: var(--signal); stroke: var(--sheet); stroke-width: 0.08; }
+.marker-pulse { fill: var(--signal); fill-opacity: 0.25; }
 .marker.located .marker-pulse { animation: pulse 1.6s ease-out infinite; transform-box: fill-box; transform-origin: center; }
-.marker.tentative .marker-dot { fill: var(--warn); }
-.marker.tentative .marker-pulse { fill: var(--warn); }
+.marker.tentative .marker-dot, .marker.tentative .marker-pulse { fill: var(--caution); }
 @keyframes pulse { from { transform: scale(0.6); opacity: 1; } to { transform: scale(1.8); opacity: 0; } }
-@media (prefers-reduced-motion: reduce) { .marker.located .marker-pulse { animation: none; } }
 
-.views { display: flex; flex-direction: column; gap: 8px; }
-.views-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.region-area { fill: var(--region); fill-opacity: var(--region-fill); stroke: var(--region); stroke-opacity: 0.55;
+  stroke-width: 0.05; stroke-dasharray: 0.25 0.15; pointer-events: none; }
+.region-sweep { fill: var(--region); pointer-events: none; transition: r 0.4s, fill-opacity 0.4s; }
+.plan-tools { display: flex; justify-content: flex-end; margin-bottom: -6px; }
+.zoom-toggle { padding: 4px 10px; font-size: 0.82rem; }
+.zoom-toggle[aria-pressed="true"] { background: var(--ink); border-color: var(--ink); color: var(--sheet); }
+.plan-zone { font-size: 0.92rem; color: var(--graphite); }
+.plan-zone strong { color: var(--ink); }
+
+/* Floors: tabs ordered top floor first, like a building section. */
+.floor-tabs { display: flex; gap: 0; flex-wrap: wrap; border-bottom: 1px solid var(--rule); }
+.floor-tab { padding: 6px 12px; font-size: 0.87rem; border: none; border-bottom: 3px solid transparent; border-radius: 0; background: none; }
+.floor-tab.active { border-bottom-color: var(--signal); font-weight: 600; }
+.floor-pct { color: var(--graphite); font-variant-numeric: tabular-nums; margin-left: 4px; }
+
+/* Approach: what responders arriving from the street need, in signage type. */
+.approach-card { display: flex; gap: 16px; padding: 12px 0 12px 14px; border-left: 4px solid var(--signal); }
+.approach-card.interior { border-left-color: var(--caution); }
+.approach-main { flex: 1; min-width: 0; }
+.approach-big { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 14px; font-family: var(--sign);
+  font-weight: 600; font-size: 1.75rem; line-height: 1.1; }
+.approach-floor { color: var(--signal); }
+.approach-text { margin: 4px 0 8px; font-size: 0.92rem; max-width: 70ch; }
+.approach-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; font-size: 0.82rem; color: var(--graphite); }
+.approach-tag.front { color: var(--clear); font-weight: 600; }
+.approach-tag.warn { color: var(--caution); font-weight: 600; }
+.approach-photo img { display: block; width: 220px; max-width: 100%; border: 1px solid var(--rule); }
+
+/* Photos of the shown room. */
+.views { display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--rule); padding-top: 12px; }
+.views-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.views-sub { margin-left: 8px; font-weight: 400; color: var(--graphite); font-size: 0.85rem; }
 .sweep-shots { display: flex; flex-direction: column; gap: 4px; }
-button.link { border: none; background: none; padding: 0; color: var(--room); font-size: 0.8rem; text-decoration: underline; }
-.view-strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
-.view-strip img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 4px; }
+.view-strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; }
+.view-strip img { width: 100%; aspect-ratio: 1; object-fit: cover; display: block; }
 
-.messages { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; max-height: 38vh; overflow-y: auto; }
-.msg { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; border-radius: 8px; max-width: 90%; font-size: 0.9rem; }
-.msg-who { font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
-.msg-dispatch { background: var(--bg); align-self: flex-start; }
-.msg-caller { background: var(--accent-soft); align-self: flex-end; }
-.msg-system { background: transparent; border: 1px dashed var(--border); color: var(--muted); align-self: center; }
+/* ---- the text thread ------------------------------------------------------------------------------------------ */
 
-.caller-box { display: flex; flex-direction: column; gap: 6px; border-top: 1px solid var(--border); padding-top: 10px; }
-.caller-box label { font-size: 0.8rem; color: var(--muted); }
+.messages { list-style: none; margin: 0; padding: 0 2px 0 0; display: flex; flex-direction: column; gap: 8px;
+  max-height: 40vh; overflow-y: auto; }
+.msg { display: flex; flex-direction: column; gap: 4px; padding: 8px 12px; border-radius: 14px; max-width: 86%;
+  font-size: 0.92rem; line-height: 1.4; }
+/* What we sent sits on the right, as on the dispatcher's own phone; the caller's words on the left. */
+.msg-dispatch { align-self: flex-end; background: var(--ink); color: var(--sheet); border-bottom-right-radius: 4px; }
+.msg-caller { align-self: flex-start; background: var(--sheet); border: 1px solid var(--rule); border-bottom-left-radius: 4px; }
+.msg-system { align-self: stretch; max-width: none; padding: 2px 4px; border-radius: 0; text-align: center;
+  font-size: 0.8rem; color: var(--graphite); }
+.msg-effect { font-size: 0.78rem; color: var(--plan); font-variant-numeric: tabular-nums; }
+
+.caller-box { display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--rule); padding-top: 12px; }
+.caller-box label { font-size: 0.8rem; color: var(--graphite); }
 .caller-row { display: flex; gap: 6px; }
-.caller-row input { flex: 1; min-width: 0; }
+.caller-row input { flex: 1; min-width: 0; border-radius: 18px; padding-left: 14px; }
+.caller-row button { border-radius: 18px; padding: 8px 16px; }
 .quick { display: flex; gap: 6px; flex-wrap: wrap; }
-.quick button { padding: 4px 10px; font-size: 0.85rem; }
+.quick button { padding: 4px 12px; font-size: 0.85rem; border-radius: 14px; }
 
-.room-bars { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+/* ---- the ranking ---------------------------------------------------------------------------------------------- */
+
+.room-bars { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
 .room-row {
-  width: 100%; display: grid; grid-template-columns: minmax(0, 1.3fr) 1fr 40px; gap: 8px; align-items: center;
-  font-size: 0.85rem; text-align: left; border-color: transparent; background: transparent; padding: 4px 6px;
+  width: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(60px, 1fr) 44px;
+  gap: 10px;
+  align-items: center;
+  font-size: 0.88rem;
+  text-align: left;
+  padding: 7px 4px;
+  border: none;
+  border-bottom: 1px solid color-mix(in srgb, var(--rule) 60%, transparent);
+  border-radius: 0;
+  background: transparent;
 }
-.room-row:hover { background: var(--bg); }
-.room-row.selected { border-color: var(--accent); background: var(--accent-soft); }
-.room-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.bar { height: 8px; background: var(--bg); border-radius: 4px; overflow: hidden; }
-.bar span { display: block; height: 100%; background: var(--room); transition: width 0.4s; }
-.room-pct { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+.room-row:hover:not(:disabled) { background: color-mix(in srgb, var(--plan) 6%, transparent); }
+.room-row.selected { box-shadow: inset 3px 0 var(--signal); padding-left: 10px; font-weight: 600; }
+.room-name { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; min-width: 0; }
+.room-name-text { min-width: 0; line-height: 1.25; }
+.room-floor { margin-left: 6px; color: var(--graphite); font-size: 0.8rem; font-weight: 400; }
+.room-badge { flex: none; font-size: 0.75rem; color: var(--graphite); font-weight: 400; }
+.room-badge.muted-badge { font-style: italic; }
+.bar { height: 6px; background: color-mix(in srgb, var(--rule) 55%, transparent); overflow: hidden; }
+.bar span { display: block; height: 100%; background: var(--plan); transition: width 0.4s; }
+.room-pct { text-align: right; color: var(--ink); font-variant-numeric: tabular-nums; font-weight: 600; }
+.tie-group { display: flex; flex-direction: column; padding: 6px 0 2px 10px; margin: 2px 0;
+  border-left: 3px solid var(--caution); background: color-mix(in srgb, var(--caution-wash) 55%, transparent); }
+.tie-label { font-size: 0.82rem; font-weight: 600; color: var(--caution); }
 
-@media (max-width: 900px) {
+/* ---- small screens and motion --------------------------------------------------------------------------------- */
+
+@media (max-width: 1000px) {
   .app { grid-template-columns: 1fr; }
-  .sidebar { border-right: none; border-bottom: 1px solid var(--border); }
-  .session-view { grid-template-columns: 1fr; grid-template-areas: "status" "plan" "conversation" "rooms"; }
+  .sidebar { border-right: none; border-bottom: 1px solid var(--rule); }
+  .session-view { grid-template-columns: 1fr; grid-template-areas: "incident" "plan" "conversation" "rooms"; }
+  .incident-numbers { align-items: flex-start; }
+  .incident-room { font-size: 2.1rem; }
 }
 
-/* Floors: one tab per floor, highest first, with the chance the caller is on it. */
-.floor-tabs { display: flex; gap: 6px; flex-wrap: wrap; }
-.floor-tab { padding: 4px 10px; font-size: 0.85rem; }
-.floor-tab.active { border-color: var(--accent); background: var(--accent-soft); font-weight: 600; }
-.floor-pct { color: var(--muted); font-variant-numeric: tabular-nums; }
-.room-floor { color: var(--muted); font-size: 0.8rem; }
+@media (prefers-reduced-motion: reduce) {
+  .marker.located .marker-pulse { animation: none; }
+  .region-sweep, .room-fill, .sweep, .bar span { transition: none; }
+}
+
+a { color: var(--plan); text-underline-offset: 2px; }
+.approach-meta a { font-weight: 600; }
+
+/* Map preview under the address field (AddressMap.jsx): where the typed address is, before the call starts. */
+.address-map { height: 190px; border: 1px solid var(--rule); background: var(--grid); }
+.address-map .leaflet-control-attribution { font-size: 9px; }

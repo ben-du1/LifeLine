@@ -18,6 +18,7 @@ import numpy as np
 
 from . import config, embeddings, followups, ingest, llm, locator, matterport, messaging, orientation, questions, semantics
 from .building import Building
+from .voice import spoken_message
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +35,8 @@ class Session:
     phone: str
     address: str
     created: float
+    channel: str = "messaging"
+    ready: asyncio.Event = field(default_factory=asyncio.Event)
     status: str = "loading"
     status_detail: str = "Looking up the address..."
     model_id: str | None = None
@@ -98,8 +101,8 @@ class SessionManager:
 
     # ---- call lifecycle -------------------------------------------------------------------------------------
 
-    async def start_call(self, phone: str, address: str) -> Session:
-        session = Session(id=uuid.uuid4().hex[:8], phone=phone.strip(), address=address.strip(), created=time.time())
+    async def start_call(self, phone: str, address: str, *, channel: str = "messaging") -> Session:
+        session = Session(id=uuid.uuid4().hex[:8], phone=phone.strip(), address=address.strip(), created=time.time(), channel=channel)
         self.sessions[session.id] = session
         # Texting the caller and loading the building happen in parallel (README step 2).
         await self._say(session, questions.OPENING_MESSAGE)
@@ -140,6 +143,8 @@ class SessionManager:
         except Exception as exc:  # surface any failure on the dashboard instead of leaving the call stuck
             session.status, session.status_detail = "error", f"{type(exc).__name__}: {exc}"
             await self.notify(session)
+        finally:
+            session.ready.set()
 
     async def _load_orientation(self, session: Session) -> None:
         """Fetch north and the street out front once per building (cached on disk), then tell the dashboard."""
@@ -319,16 +324,19 @@ class SessionManager:
         return locator.estimate(session.posterior, loaded.building.candidate_room, len(loaded.building.rooms))
 
     async def _say(self, session: Session, text: str) -> None:
+        if session.channel == "voice":
+            text = spoken_message(text)
         session.messages.append({"role": "dispatch", "text": text, "ts": time.time()})
         try:
-            await messaging.send(session.phone, text)
+            if session.channel != "voice":
+                await messaging.send(session.phone, text)
         except messaging.MessagingError as exc:
             session.messages.append({"role": "system", "text": str(exc), "ts": time.time()})
         await self.notify(session)
 
     def find_by_phone(self, phone: str) -> Session | None:
         key = normalize_phone(phone)
-        matches = [s for s in self.sessions.values() if normalize_phone(s.phone) == key]
+        matches = [s for s in self.sessions.values() if s.channel != "voice" and normalize_phone(s.phone) == key]
         return max(matches, key=lambda s: s.created) if matches else None
 
     def room_shots(self, session: Session) -> list[dict]:
@@ -360,7 +368,7 @@ class SessionManager:
     def snapshot(self, session: Session) -> dict:
         data = {
             "id": session.id, "phone": session.phone, "address": session.address, "created": session.created,
-            "status": session.status, "status_detail": session.status_detail, "model_id": session.model_id,
+            "status": session.status, "status_detail": session.status_detail, "model_id": session.model_id, "channel": session.channel,
             "match": session.match,
             "orientation": bool(session.model_id) and orientation.path(session.model_id).exists(),
             "messages": session.messages, "questions_asked": len(session.asked),

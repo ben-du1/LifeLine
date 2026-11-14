@@ -13,6 +13,7 @@ Built for the CoStar × Matterport track ("Inside and Out: AI for the Built Worl
 | Room photos per call (API + dashboard gallery) | Working, verified |
 | Spot within the room ("what's closest to you?", uncertainty circle) | Working: mean error 3.1 m → 1.0 m on three photo-checked spots; verified in the browser |
 | Photon iMessage (send + receive) | Working, verified with a real phone |
+| Photon + ElevenLabs voice | Voice transport and agent setup added; transport tests pass. Live calls need an eligible Photon voice line, running backend, and HTTPS tunnel. See [voice setup](voice/README.md). |
 | Orientation: north-up plan + nearest street (OpenStreetMap) | Working, verified on two houses |
 | Multi-floor buildings | Working, verified: eval 4/4 rooms and floors. In the browser, the floor tabs follow the estimate and the plan switches floors after the caller's answer. |
 | Optional Claude layer (`llm.py`) | Written and unit-tested with a stub; **never run live** (no key) |

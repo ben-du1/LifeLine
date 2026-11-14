@@ -1,0 +1,14 @@
+{
+  "name": "caller-locator-voice",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "setup": "node --env-file=../.env.local setup.mjs",
+    "start": "node --env-file-if-exists=../.env --env-file=../.env.local gateway.mjs",
+    "test": "node --test gateway.test.mjs"
+  },
+  "dependencies": {
+    "@elevenlabs/elevenlabs-js": "^2.78.0"
+  }
+}

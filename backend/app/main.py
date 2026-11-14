@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from . import config, embeddings, llm, orientation, semantics
 from .sessions import Session, SessionManager
+from .voice_routes import create_router
 
 logging.basicConfig(level=logging.INFO)
 clients: set[WebSocket] = set()
@@ -38,6 +39,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Caller locator", lifespan=lifespan)
+app.include_router(create_router(manager))
 config.BUILDINGS_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/buildings", StaticFiles(directory=config.BUILDINGS_DIR), name="buildings")
 

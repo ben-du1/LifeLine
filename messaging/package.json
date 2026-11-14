@@ -1,0 +1,10 @@
+{
+  "name": "caller-locator-messaging",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Photon iMessage sidecar (Beta REST API): sends texts for the backend and forwards caller replies to it.",
+  "scripts": {
+    "start": "node --env-file=../.env index.mjs"
+  }
+}

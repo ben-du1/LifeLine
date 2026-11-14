@@ -1,0 +1,12 @@
+# Install torch first from the CPU index (see README), then: pip install -r requirements.txt
+torch==2.15.0
+torchvision==0.29.2
+open_clip_torch==4.2.2
+fastapi==0.162.7
+uvicorn[standard]==0.54.0
+httpx==0.28.1
+anthropic==2.8.0   # optional Claude follow-ups (llm.py), used only when ANTHROPIC_API_KEY is set
+sentence-transformers==6.3.0   # local paraphrase matching of caller messages (semantics.py)
+numpy==2.4.6
+pillow==13.0.0
+pytest==9.2.0

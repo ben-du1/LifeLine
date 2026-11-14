@@ -1,0 +1,6 @@
+- Before editing, read the nearest working code. Match its naming, formatting, and error handling.
+- Keep the diff focused. Reuse existing functions and add dependencies only when the feature needs them.
+- Use straightforward control flow. Extract a helper when it makes the caller easier to read.
+- Comment on hardware assumptions, timing constraints, and reasons a decision was made.
+- Run the relevant check and report what you verified.
+- Leave staging, committing, and pushing to me.

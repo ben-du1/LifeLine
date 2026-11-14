@@ -1,0 +1,42 @@
+# Secrets (API keys live in the repo-root .env; .env.example documents the variable names)
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
+npm-debug.log*
+
+# Local data: downloaded Matterport interiors (licensed "hackathon use only"), embeddings, caches, SQLite
+data/
+*.db
+
+# Logs and scratch output
+*.log
+logs/
+
+# Personal tool settings (shared Claude Code settings would go in .claude/settings.json, which stays tracked)
+.claude/settings.local.json
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

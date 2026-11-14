@@ -13,7 +13,7 @@ Built for the CoStar × Matterport track ("Inside and Out: AI for the Built Worl
 | Room photos per call (API + dashboard gallery) | Working, verified |
 | Photon iMessage (send + receive) | Working, verified with a real phone |
 | Orientation: north-up plan + nearest street (OpenStreetMap) | Working, verified on two houses |
-| **Multi-floor buildings** | **Backend, planner and eval done (4/4 rooms and floors). Dashboard floor tabs are built, but have not been checked in a browser yet (work paused).** |
+| Multi-floor buildings | Working, verified: eval 4/4 rooms and floors. In the browser, the floor tabs follow the estimate and the plan switches floors after the caller's answer. |
 | Optional Claude layer (`llm.py`) | Written and unit-tested with a stub; **never run live** (no key) |
 | Vexcel aerial overlay | Tried and removed (see "Orientation"). CoStar data: not used. |
 
@@ -459,7 +459,6 @@ buildings on first run).
 ## Known limitations
 
 - Floors are identified by order only: the lowest floor is the "ground floor", and basements aren't recognised.
-- Multi-floor dashboard view (floor tabs, per-floor plan) is not yet verified in a browser.
 - An approximate address match (e.g. the neighbouring house) is a *different building*. The dashboard flags it, and
   the dispatcher should confirm it with the caller.
 - Address matching is tuned for US street addresses; other formats are untested.

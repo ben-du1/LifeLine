@@ -203,6 +203,17 @@ GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "")
 
 # ==== caller-initiated calls: one block per workstream; edit only your own block ====
 # ---- A: address matching (resolve.py, addresses.py)
+# resolve.py bands, over the same 0..1 score as ADDRESS_MATCH_THRESHOLD. "match" needs an exact address (house number
+# and street) scoring at least ADDRESS_MATCH_THRESHOLD. Anything else at or above ADDRESS_CLARIFY_THRESHOLD is asked
+# about once: "clarify" when the best model leads the next one by at least ADDRESS_CLARIFY_MARGIN, "choose" between
+# the top two when it doesn't. 0.65 keeps a swapped-digit house number (13212 for 13122 scores 0.79) and a missing
+# house number, but not a street that shares one word ("5819 Eldridge Glen Dr" scores 0.30). A neighbouring house
+# scores ~0.09 below the exact one (13120 vs 13122), so 0.10 makes two neighbours a choice when neither is exact.
+ADDRESS_CLARIFY_THRESHOLD = 0.65
+ADDRESS_CLARIFY_MARGIN = 0.10
+# How many catalog rows (catalog.py, ~15,000 models) are scored per caller address after the street-word prefilter.
+# Scoring is ~50 us per row, so 60 keeps resolve() in single milliseconds on a laptop.
+ADDRESS_CATALOG_CANDIDATES = 60
 # ---- B: intake and handoff (sessions.py, handoff.py, main.py)
 # ---- C: caller language (questions.py, semantics.py)
 # ---- D: voice and platform (voice.py, phones.py, .env loading)

@@ -199,3 +199,10 @@ VEXCEL_EXTRACT_URL = os.environ.get("VEXCEL_EXTRACT_URL", "https://api.vexcelgro
 AERIAL_SIZE_M = float(os.environ.get("AERIAL_SIZE_M", "110"))
 
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "")
+
+
+# ==== caller-initiated calls: one block per workstream; edit only your own block ====
+# ---- A: address matching (resolve.py, addresses.py)
+# ---- B: intake and handoff (sessions.py, handoff.py, main.py)
+# ---- C: caller language (questions.py, semantics.py)
+# ---- D: voice and platform (voice.py, phones.py, .env loading)

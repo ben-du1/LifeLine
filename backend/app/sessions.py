@@ -1,6 +1,7 @@
 """Call sessions: building lookup/loading, the question loop, and snapshots for the dashboard.
 
-Status flow:  loading -> listening -> located | best_guess
+Status flow:  awaiting_address -> loading (caller-initiated calls) | transferred (address outside coverage)
+              loading -> listening -> located | best_guess
               loading -> no_model | error
               any -> out, when the caller texts that they got out of the building
 Replies that arrive while the building is still loading are queued and processed once it is ready.
@@ -21,7 +22,9 @@ from . import (config, embeddings, followups, ingest, layout, llm, locator, matt
                questions, semantics)
 from .building import Building
 from .addresses import is_exact, similarity
+from .resolve import cached_models, find_matches  # re-exported: main.py and tests use sessions.*
 from . import approach, geo, subroom, ties, adjacency, textmatch
+from . import handoff, phones, resolve
 
 log = logging.getLogger(__name__)
 
@@ -80,6 +83,11 @@ class Session:
     safety_sent: bool = False                                    # smoke/fire advice goes out once per call
     danger: bool = False                                         # caller mentioned smoke, fire, or trouble breathing
     estimate: locator.Estimate | None = None
+    # ---- caller-initiated calls (contract; owner: workstream B)
+    address_attempts: int = 0                                    # addresses tried that didn't resolve
+    rejected_models: set[str] = field(default_factory=set)       # models the caller said "no" to
+    out_pending: bool = False                                    # asked OUT_CONFIRM, waiting for yes/no
+    transfer: dict | None = None                                 # handoff.transfer_to_emergency_services record
 
 
 def _odds(p: float) -> float:
@@ -90,39 +98,6 @@ def normalize_phone(phone: str) -> str:
     """Compare phones by their last 10 digits so '+1 (609) 555-1234' matches '6095551234'."""
     digits = "".join(ch for ch in phone if ch.isdigit())
     return digits[-10:]
-
-
-def cached_models() -> list[dict]:
-    """Already-ingested buildings as [{id, name, address}], so they can match without (or before) a search."""
-    if not config.BUILDINGS_DIR.exists():
-        return []
-    models = []
-    for path in config.BUILDINGS_DIR.glob("*/building.json"):
-        data = json.loads(path.read_text(encoding="utf-8"))
-        models.append({"id": data["id"], "name": data["name"], "address": data["address"]})
-    return models
-
-
-def find_matches(address: str) -> list[dict]:
-    """Matterport models whose address is sufficiently similar to `address`, best first (see addresses.py).
-    Cached buildings come first on ties since they load instantly; if the search API is unreachable, the cache alone
-    is used so the demo still works offline."""
-    models = cached_models()
-    cached = matterport.rank_matches(address, models)
-    if cached and cached[0]["exact"]:
-        # A downloaded building with this exact address: no need to search. The search is 3 GraphQL calls with long
-        # timeouts, and on venue Wi-Fi it kept a demo call on "Looking up the address..." for minutes (audit #5).
-        return cached
-    try:
-        models += matterport.search_models(address)
-    except (matterport.MatterportError, httpx.HTTPError) as exc:
-        log.warning("Matterport search failed, matching against cached buildings only: %s", exc)
-    unique, seen = [], set()
-    for model in models:
-        if model["id"] not in seen:
-            seen.add(model["id"])
-            unique.append(model)
-    return matterport.rank_matches(address, unique)
 
 
 def describe_match(match: dict) -> str:
@@ -150,6 +125,11 @@ class SessionManager:
         await self._say(session, questions.OPENING_MESSAGE)
         asyncio.create_task(self._load(session))
         return session
+
+    async def open_call(self, phone: str | None, channel: str, first_text: str | None = None) -> Session:
+        """A call the caller started (a text or a phone call) with no address yet: status "awaiting_address", ask for
+        the address (or use `first_text` if it already is one). Contract; workstream B implements it."""
+        raise NotImplementedError("open_call is implemented by workstream B")
 
     async def _load(self, session: Session) -> None:
         try:
@@ -674,9 +654,9 @@ class SessionManager:
 
     def snapshot(self, session: Session) -> dict:
         data = {
-            "id": session.id, "channel": session.channel, "revision": session.revision, "ended": session.ended, "phone": session.phone, "address": session.address, "created": session.created,
+            "id": session.id, "channel": session.channel, "revision": session.revision, "ended": session.ended, "phone": session.phone or None, "address": session.address, "created": session.created,
             "status": session.status, "status_detail": session.status_detail, "model_id": session.model_id,
-            "match": session.match, "danger": session.danger,
+            "match": session.match, "danger": session.danger, "transfer": session.transfer,
             "orientation": bool(session.model_id) and orientation.path(session.model_id).exists(),
             "messages": session.messages, "questions_asked": len(session.asked),
             "max_questions": config.MAX_QUESTIONS, "rooms": [], "floors": [], "candidate_probabilities": [],

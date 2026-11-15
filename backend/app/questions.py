@@ -132,6 +132,36 @@ def is_correction(text: str) -> bool:
     return bool(_CORRECTION.search(text))
 
 
+# ---- caller-initiated calls (contract; owner: workstream C). Draft wording; C finalizes it.
+ADDRESS_QUESTION = (
+    "911: If you can get out safely, get out now and text OUT. "
+    "If you can't, what is the address of the building you're in?"
+)
+ADDRESS_RETRY = "I couldn't find that address. Please send the street number, street name and city."
+ADDRESS_CONFIRM = "Did you mean {address}?"
+ADDRESS_CHOOSE = "Is it {a} or {b}?"
+OUT_OF_AREA_MESSAGE = (
+    "That address isn't in this system's service area. "
+    "I'm connecting you to standard emergency services now. Stay on the line."
+)
+OUT_CONFIRM = "Are you outside the building now? Yes or no."
+
+
+def for_channel(text: str, channel: str) -> str:
+    """The message as it should be sent on `channel` ("messaging" or "voice"). Phase 0 stub: unchanged."""
+    return text
+
+
+def out_signal(text: str):
+    """"out" (act now), "maybe" (ask OUT_CONFIRM first) or None. Phase 0 stub: today's is_out."""
+    return "out" if is_out(text) else None
+
+
+def looks_like_address(text: str) -> bool:
+    """True when the text reads like a street address (a house number, then a street word). Phase 0 stub."""
+    return bool(re.search(r"\b\d{1,6}\s+[A-Za-z]", text))
+
+
 def is_out(text: str) -> bool:
     return bool(_OUT.search(text)) and not _NOT_OUT.search(text)
 

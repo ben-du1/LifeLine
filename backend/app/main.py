@@ -154,12 +154,14 @@ async def ask(session_id: str, body: AskIn) -> dict:
 
 @app.post("/api/inbound")
 async def inbound(body: InboundIn) -> dict:
-    """Real caller replies, forwarded by the messaging sidecar."""
+    """Caller texts, forwarded by the messaging sidecar. A text from a number with no open call (none, ended, or
+    quiet for SESSION_REUSE_MINUTES) opens a new caller-initiated call, which starts by asking for the address."""
     session = manager.find_by_phone(body.sender)
     if session is None:
-        raise HTTPException(404, "No session for this phone number")
+        session = await manager.open_call(body.sender, "messaging", body.text, event_id=body.event_id)
+        return {"ok": True, "session": session.id, "created": True}
     await manager.handle_reply(session, body.text, event_id=body.event_id)
-    return {"ok": True, "session": session.id}
+    return {"ok": True, "session": session.id, "created": False}
 
 
 @app.get("/api/buildings/{model_id}")

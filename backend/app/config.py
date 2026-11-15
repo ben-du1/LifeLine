@@ -204,5 +204,11 @@ GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "")
 # ==== caller-initiated calls: one block per workstream; edit only your own block ====
 # ---- A: address matching (resolve.py, addresses.py)
 # ---- B: intake and handoff (sessions.py, handoff.py, main.py)
+# Wrong or unknown addresses the caller gets to correct before the call is handed to standard 911. One retry: a
+# trapped caller should not spend minutes spelling an address this system can't serve anyway.
+ADDRESS_RETRIES = 1
+# A text from a number whose last call went quiet this long ago starts a new call instead of continuing the old one
+# (minutes since that call's last message).
+SESSION_REUSE_MINUTES = 30
 # ---- C: caller language (questions.py, semantics.py)
 # ---- D: voice and platform (voice.py, phones.py, .env loading)

@@ -19,7 +19,7 @@ changes.
   - `locator.py`: pure-numpy Bayesian update.
   - `ingest.py`: Matterport download into the `data/` cache.
   - `config.py`: every tunable value, each with a comment explaining it. Read that comment before changing a value.
-- `backend/tests/`: pytest (44 tests). `backend/scripts/eval_scenarios.py`: scripted callers, the accuracy check (14/19 top room, 0 confidently wrong).
+- `backend/tests/`: pytest (60 tests). `backend/scripts/eval_scenarios.py [--noisy]`: scripted callers, the accuracy check (25/27 top room, no caller told a wrong room; 25/27 with 15% wrong answers).
 - `dashboard/`: React + Vite; `src/App.jsx` and `src/FloorPlan.jsx` (SVG plan, north-up, floor-aware).
 - `messaging/`: Node sidecar for Photon's Beta REST API (no npm dependencies).
 - `data/buildings/<model_id>/`: downloaded interiors and embeddings (gitignored; Matterport content is licensed
@@ -31,7 +31,7 @@ changes.
   `.venv/Scripts/python` can fail ("No module named app" or exit 127). Use
   `/c/Users/ben/desktop/coding/hackprinecton-mvp/backend/.venv/Scripts/python` and `cd` into `backend/` in the same
   command.
-- **Tests:** `cd backend && .venv/Scripts/python -m pytest -q` (44 tests, ~50 s).
+- **Tests:** `cd backend && .venv/Scripts/python -m pytest -q` (60 tests, ~60 s).
 - **Eval:** `cd backend && MESSAGING_MODE=simulated .venv/Scripts/python scripts/eval_scenarios.py -v`. It is slow
   the first time, because it ingests 3 buildings.
 - **Backend:** `cd backend && .venv/Scripts/python -m uvicorn app.main:app --port 8000`.
@@ -72,11 +72,24 @@ changes.
   - free text splits a room's share among its sweeps at `IN_ROOM_LOGIT_SCALE`, while room totals are unchanged;
   - in-room check: mean error 3.1 m → 1.0 m. The check script lives outside the repo (the session scratchpad);
     its scenarios are listed in the README.
+- **Caller safety:** texts never say "stay where you are" unconditionally (the building may be burning): get out
+  first, text OUT (`status = "out"`), smoke advice once, danger flag. See the README's "Caller safety".
+- **Locating revamp (2026-11-14):**
+  - `layout.py`: doors/windows per room from Matterport room-boundary openings (cached `layout.json`), feeding
+    layout questions (window count, what's outside your door, door outside / into a bathroom / closet, street view);
+  - room names count only as location claims (`questions.room_mentions`), never comparisons;
+  - a confident room is checked (`followups.verification`, odds x2) before the caller is told; questions continue
+    after "located" while under `CONFIRM_UNTIL`; `POST /api/sessions/{id}/ask` for the dispatcher.
 - **Multi-floor:**
   - all floors are ingested;
-  - the floor question comes first while no floor has 80%;
-  - "located" also requires the floor to be at least 80% likely;
+  - the floor question always comes first unless the caller already said the floor (a live call once reached 80% on
+    the wrong floor from photo matches alone); "I don't know" leads to "how many flights of stairs?";
+  - "located" also requires a floor answer (or "don't know") and the floor to be at least 80% likely;
   - unlabeled regions are kept only in models that label no rooms.
+
+- **Reading replies (2026-11-14, after a live call):** `questions.normalize` maps phones' curly apostrophes first;
+  only text that `questions.describes_something` is scored against the photos; an unreadable answer gets one re-ask
+  with a hint, never a third. "Front, middle or back of the house?" comes from the street direction.
 
 ## Open work
 - **Multi-floor:** done and verified: eval 4/4 on 3012 Houston Ave (model `M7BdXkpzrrE`), plus a browser check of

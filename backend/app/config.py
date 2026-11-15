@@ -72,15 +72,36 @@ LOGIT_SCALE = 60.0
 # total is computed exactly as before, so room-level results don't change.
 IN_ROOM_LOGIT_SCALE = 15.0
 # A caller naming the room type ("I'm in the bathroom") is strong evidence. At 5x it lost to image noise: a room with
-# many sweeps (the kitchen has 11) always has one that happens to score well against any text.
+# many sweeps (the kitchen has 11) always has one that happens to score well against any text. It is no longer taken
+# on trust, though: the leading room is checked with a verification question before it is reported (see
+# followups.verification), and that check (~7x at LAYOUT_YES/LAYOUT_NO) can overturn a claim. Only names said as a
+# location count (questions.room_mentions), not "big like a living room".
 ROOM_KEYWORD_BOOST = 20.0
+# "I'm not in the bathroom": rooms of that type keep this fraction of their probability.
+ROOM_DENIAL_FACTOR = 0.2
+# Corroboration (followups.verification): the best check must be worth at least this many bits about "this room or
+# not" (judged at 50/50). Below it nothing in the bank can check the room (two identical photo-less closets), and the
+# room is reported unverified rather than asking a question that can't help.
+VERIFY_MIN_GAIN = 0.15
+# A check corroborates the room only if its answer multiplied the room's odds by at least this much (a layout answer
+# that fits only this room gives ~7x; one that fits the runner-up equally gives ~1x and doesn't count).
+VERIFY_MIN_ODDS = 2.0
+# After the caller is told where responders will look, questions continue (to confirm, then where in the room) while
+# the room is less than this likely. Answers can still move the estimate; the caller is re-told if the room changes.
+CONFIRM_UNTIL = 0.9
+# When the dispatcher presses "Ask next best question", any question worth more than this (bits) is asked: they decide
+# it's worth the caller's time, so only questions that can't change anything at all are refused.
+DISPATCHER_MIN_GAIN = 0.005
 # Score given to rooms without sweeps (no photos), as a quantile of the imaged candidates' scores. In scripted
 # truthful-caller runs on the sample model, 0.5 kept kitchen/living/hallway callers correct; 0.75 let photo-less rooms
 # soak up probability, and averaging likelihoods instead (more "Bayesian") made them win far too often.
 IMAGELESS_SCORE_QUANTILE = 0.5
 CONFIDENCE_THRESHOLD = 0.6
 CONFIDENCE_MARGIN = 0.25
-MAX_QUESTIONS = 6
+# Automatic follow-ups per call (verification and confirmation questions included; "what's closest to you?" and
+# questions the dispatcher asks for are not counted). Raised from 6 when verification was added: each checked room
+# costs one question.
+MAX_QUESTIONS = 8
 # Stop asking follow-ups when the best one is expected to resolve less than this many bits about the room. 0.05 bits
 # is roughly a question that would move a 50/50 pair of rooms to 60/40 only half the time: not worth a caller's text.
 MIN_INFORMATION_GAIN = 0.05
@@ -90,6 +111,10 @@ MIN_INFORMATION_GAIN = 0.05
 FLOOR_ANSWER_ACCURACY = 0.9
 # The floor question goes first while no floor is at least this likely (see followups.choose).
 FLOOR_FIRST_UNTIL = 0.8
+# "How many flights of stairs did you climb?" (asked when the caller doesn't know the floor) is weaker evidence than
+# a floor answer: the caller may have entered from a raised porch or a lower street level, come down from above, or
+# miscounted landings. 0.75 still moves a three-floor split to 75% on the floor it names: one more answer settles it.
+STAIRS_ANSWER_ACCURACY = 0.75
 
 # Where in the located room (followups.refinement): at most MAX_REFINEMENTS "what's closest to you?" questions, asked
 # only while the probability-weighted spread of the room's scan points exceeds REFINE_MIN_SPREAD_M (1.5 m: about the

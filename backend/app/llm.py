@@ -36,7 +36,9 @@ READ_SCHEMA = {
         "answer": {"type": "string", "enum": ["yes", "no", "none", "unsure", "not_answered"],
                    "description": "The caller's reply to the pending yes/no or 'which of these' question."},
         "options": {"type": "array", "items": {"type": "string",
-                    "enum": [o.key for c in followups.CHOICES for o in c.options]
+                    "enum": sorted({o.key for c in [*followups.CHOICES, followups.WINDOWS_CHOICE,
+                                                     followups.POSITION_CHOICE] for o in c.options}
+                                   | {key for key, *_ in followups.DOOR_OPTIONS})
                     + [f"floor{i}" for i in range(12)]},
                     "description": "Option keys the caller chose, if the pending question was a choice."},
         "mentioned": {"type": "array", "items": {
@@ -203,7 +205,9 @@ def phrase_question(plan: followups.Plan, messages: list[dict], acknowledgement:
         f"Conversation so far:\n{_conversation(messages)}\n\n"
         f"Write the dispatcher's next text message. It must ask {topic}. Briefly acknowledge what the caller just "
         f"said if useful (a suggested acknowledgement: \"{acknowledgement}\"). One or two short sentences, at most "
-        "30 words, calm and plain, no emoji, ending with a question mark. Do not ask about anything else."
+        "30 words, calm and plain, no emoji, ending with a question mark. Do not ask about anything else. Do not "
+        "give safety advice or tell the caller to stay where they are: the building may be on fire, and fixed "
+        "safety texts are sent separately."
     )
     data = _call(prompt, QUESTION_SCHEMA)
     question = (data or {}).get("question", "").strip()

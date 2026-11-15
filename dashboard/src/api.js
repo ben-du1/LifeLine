@@ -16,6 +16,9 @@ export const getBuilding = (modelId) => request(`/api/buildings/${modelId}`);
 export const getRoomShots = (sessionId) => request(`/api/sessions/${sessionId}/rooms`);
 export const startCall = (phone, address) =>
   request("/api/calls", { method: "POST", body: JSON.stringify({ phone, address }) });
+// Dispatcher: send `text` as their own question, or (no text) let the system ask the next best question.
+export const askQuestion = (sessionId, text = "") =>
+  request(`/api/sessions/${sessionId}/ask`, { method: "POST", body: JSON.stringify({ text }) });
 export const sendReply = (sessionId, text) =>
   request(`/api/sessions/${sessionId}/reply`, { method: "POST", body: JSON.stringify({ text }) });
 

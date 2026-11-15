@@ -51,3 +51,16 @@ def test_rank_matches_filters_and_orders():
     ranked = matterport.rank_matches("13122 Chipman Glen Dr, Houston", models)
     assert [m["id"] for m in ranked] == ["exact", "near"]
     assert ranked[0]["exact"] and not ranked[1]["exact"]
+
+
+def test_name_match_keeps_the_address_city():
+    # The name "2810 Princeton St" alone has no city, so it used to score 1.0 for a Princeton, NJ query and beat the
+    # real Princeton model. Its address field says Houston, which must still count against it.
+    models = [
+        {"id": "houston", "name": "2810 Princeton St", "address": "2810 Princeton St, Houston, TX, 77009, US"},
+        {"id": "princeton", "name": "Princeton - Rabinowitz Hall", "address": "Princeton, Princeton, NJ, 08544, US"},
+    ]
+    ranked = matterport.rank_matches("Princeton, Princeton, NJ, 08544, US", models)
+    assert [m["id"] for m in ranked] == ["princeton"]
+    # A Houston query for that street still finds the Houston model through its name.
+    assert matterport.rank_matches("2810 Princeton St, Houston", models)[0]["id"] == "houston"

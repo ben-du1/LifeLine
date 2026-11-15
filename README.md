@@ -9,10 +9,13 @@ Built for the CoStar × Matterport track ("Inside and Out: AI for the Built Worl
 |---|---|
 | Core loop (call → texts → room estimate → dot on plan), simulated caller | Working, verified |
 | Address → Matterport model (fuzzy matching) | Working, verified against the live API |
-| Follow-up questions (cues, information gain, paraphrase matching) | Working; scripted eval 14/19 top room, 0 confidently wrong |
+| Follow-up questions (cues, information gain, paraphrase matching) | Working; scripted eval 25/27 top room, no caller ever told a wrong room (also 25/27, none told wrong, with 15% wrong answers) |
+| Layout questions (doors, windows, street view) from Matterport's room boundaries | Working, verified on 3 houses |
+| Corroboration before "located", questions after it, dispatcher "ask another question" | Working; verified in the browser |
 | Room photos per call (API + dashboard gallery) | Working, verified |
 | Spot within the room ("what's closest to you?", uncertainty circle) | Working: mean error 3.1 m → 1.0 m on three photo-checked spots; verified in the browser |
 | Photon iMessage (send + receive) | Working, verified with a real phone |
+| Caller safety texts (get out first, "OUT", smoke advice, danger flag) | Working; tested with simulated calls, not yet over iMessage |
 | Orientation: north-up plan + nearest street (OpenStreetMap) | Working, verified on two houses |
 | Multi-floor buildings | Working, verified: eval 4/4 rooms and floors. In the browser, the floor tabs follow the estimate and the plan switches floors after the caller's answer. |
 | Optional Claude layer (`llm.py`) | Written and unit-tested with a stub; **never run live** (no key) |
@@ -30,7 +33,8 @@ text conversation with the caller.
 1. **911 call comes in.** The caller's phone number and address are forwarded to our program. For this MVP they are
    entered on the dispatcher dashboard (simulated 911 input).
 2. **Two things start in parallel:**
-   - The program texts the caller over iMessage (via Photon) and asks them to describe the room they are in.
+   - The program texts the caller over iMessage (via Photon). The first text tells them to get out if they safely
+     can and text OUT; only if they can't does it ask them to describe the room they are in (see "Caller safety").
    - The address is matched to the Matterport digital twin whose address is most similar. The match does not have
      to be exact (see "Address matching"), and approximate matches are flagged to the dispatcher. The building is
      downloaded and embedded the first time, and read from the local cache afterwards.
@@ -39,9 +43,12 @@ text conversation with the caller.
 4. **Each caller reply updates a belief over locations.** An image-text embedding model scores how well the reply
    matches every view; the scores update a probability distribution over sweeps, which is summed per room (and per
    floor in multi-storey buildings).
-5. **Confident or ask again.**
-   - If the top room passes the confidence rule, the dashboard shows the floorplan with a dot at the most likely
-     sweep's position, and the caller is told help knows where they are.
+5. **Confident, checked, or ask again.**
+   - If the top room passes the confidence rule, one independent fact is checked first ("To make sure we send
+     responders to the right room: what is right outside your door?"). Only an answer that clearly fits that room
+     (odds up 2x) confirms it; otherwise more checks follow. Then the caller is told where responders will look.
+   - Questions continue after that while the room is under 90% likely, and the dispatcher can ask for another
+     question (or type their own) at any time.
    - Otherwise the program asks a follow-up that builds on what the caller said ("I'm in a cramped space" → "You
      said it's a tight space. Can you see a sink or faucet?"). It is chosen to best split the rooms still in play,
      and step 4 repeats. In a multi-storey building, "Which floor are you on?" comes first while the floor is
@@ -110,6 +117,7 @@ Sessions are kept in memory in the backend (restarting the backend clears them).
 | `building.py`   | Loads a cached building (floors, rooms, candidates); per-candidate text scores; floorplan pixel mapping. |
 | `embeddings.py` | Wraps the open_clip model (image and text encoders). |
 | `locator.py`    | Pure-numpy belief update, confidence rule, and expected information gain. |
+| `layout.py`     | Doors (and what they lead to) and windows of every room, from Matterport's room boundaries; cached in `layout.json`. |
 | `followups.py`  | Reads cues from the caller's words; feature model (CLIP + room labels + geometry + floors); plans follow-ups. |
 | `semantics.py`  | Local paraphrase matching of caller messages (sentence embeddings). |
 | `orientation.py`| North-up heading (Matterport) and the nearest street (OpenStreetMap Nominatim) for the floor plan. |
@@ -129,22 +137,41 @@ Sessions are kept in memory in the backend (restarting the backend clears them).
 | GET    | `/api/sessions/{id}`           | One session snapshot |
 | GET    | `/api/sessions/{id}/rooms`     | Every room of the call's building, most likely first: `{index, name, types, floor, area_m2, probability, sweeps[{candidate, x, y, probability, views[url]}]}` |
 | POST   | `/api/sessions/{id}/reply`     | `{text}`: simulated caller reply from the dashboard |
+| POST   | `/api/sessions/{id}/ask`       | `{text?}`: the dispatcher's own question, or (no text) the system's next best question; works after "located" too. 409 with a reason if nothing useful is left |
 | POST   | `/api/inbound`                 | `{from, text}`: real caller reply, posted by the messaging sidecar |
 | WS     | `/ws`                          | Pushes `{type: "session", session}` on every change |
 | GET    | `/api/buildings/{model_id}`    | Cached `building.json` (`floors`, `floorplans` per floor, rooms with `floor`/walls/polygon/centroid, candidates) with asset URLs, plus `orientation` (`yaw_deg`, `street{name, distance_m, bearing_deg, side, direction_deg}`) once fetched |
 | GET    | `/buildings/{model_id}/...`    | Cached floorplan and view images |
 
 Session snapshot fields: `id, phone, address, status, status_detail, model_id`,
-`match{id, name, address, score, exact}` (the Matterport property in use), `messages[{role, text, ts}]`
-(`role` is `dispatch`, `caller` or `system`), `questions_asked, max_questions`,
+`match{id, name, address, score, exact}` (the Matterport property in use), `messages[{role, text, ts, source?}]`
+(`role` is `dispatch`, `caller` or `system`; `source: "dispatcher"` marks questions the dispatcher typed), `questions_asked, max_questions`,
 `rooms[{index, name, floor, floor_label, probability}]` (sorted), `floors[{index, label, probability}]`,
 `orientation` (true once north/street data is cached), `candidate_probabilities[]` (aligned with the building's
 `candidates`), and `estimate{room, room_name, floor, floor_label, candidate, x, y, radius_m, room_probability,
-runner_up_probability, confident}`. In `estimate`:
+runner_up_probability, confident, checked}`. In `estimate`:
+- `checked` is true once a caller answer corroborated this room (false: not yet, or nothing could check it).
 - `x, y` is the probability-weighted position of the top room's scan points.
 - `radius_m` is its uncertainty (RMS spread, at least 0.75 m).
 - `candidate` is the single most likely scan point.
-Statuses: `loading → listening → located | best_guess`, or `no_model` / `error`.
+Statuses: `loading → listening → located | best_guess`, or `no_model` / `error`; any status becomes `out` when the
+caller texts that they got out.
+
+### Caller safety
+
+The building may be on fire, so no text tells the caller to stay put no matter what. The fixed texts are in
+`questions.py`:
+- **Getting out comes first.** The opening text says: get out if you safely can and text OUT; otherwise tell us the
+  room. Every closing text says to text us if they move or get out.
+- **"OUT"** (`questions.is_out`: "OUT", "I'm out", "we got outside", but not "I can't get out" or "out of
+  breath") stops the questions, tells the caller to stay away from the building, and asks about anyone still
+  inside. Later texts are shown on the dashboard as the call's note, and the dot is removed from the plan.
+- **Smoke advice** (stay low, keep the door closed, block the gap, signal from a window) is sent once: right after
+  "located", or as soon as the caller mentions smoke, fire, or trouble breathing (`questions.mentions_danger`).
+  That mention also flags the call in red on the dashboard.
+- **Moving** ("I moved to the bedroom", "now I'm in…") restarts the estimate, like a correction.
+- The located text and the optional "which is closest to you?" question are separate texts, safety first.
+- The Claude layer is told not to write safety advice; only these fixed texts give it.
 
 ## Matterport data
 
@@ -234,7 +261,11 @@ model at a very similar address does exist. The backend therefore picks the mode
   maximum cosine similarity over its 4 views. The caller may be facing any direction.
 - **Prior:** uniform over rooms, split evenly across a room's candidates, so rooms with many sweeps are not favored.
 - **Update:** `posterior ∝ prior × exp(LOGIT_SCALE × (score − max score))`, applied once per reply. If the reply
-  names a room type, candidates in rooms with that classification are multiplied by `ROOM_KEYWORD_BOOST`.
+  says they are in a room type, candidates in rooms with that classification are multiplied by
+  `ROOM_KEYWORD_BOOST`; "not in the bathroom" multiplies by `ROOM_DENIAL_FACTOR`. Only location claims count
+  (`questions.room_mentions`): "big like a living room" and "bedroom-sized" are comparisons, "next to the kitchen" and
+  "the closet off the bedroom" name a neighbouring room (adjacency evidence). A claim is then checked like any other
+  lead (see "Corroboration").
 - **Rooms without photos** (`Building.candidate_scores`) start from the median imaged score
   (`IMAGELESS_SCORE_QUANTILE`, roughly neutral). They are then lifted by how far photographed rooms *of the same
   type* stand out for the text (mean peer score minus mean imaged score).
@@ -262,7 +293,8 @@ model at a very similar address does exist. The backend therefore picks the mode
 - **Output:** the highest-probability candidate inside the top room; its `(x, y)` (model meters) is drawn on the
   floor plan. The dashboard shows every photo of that room, or of any room the dispatcher clicks.
 - **Current values** (`config.py`): `LOGIT_SCALE=60`, `ROOM_KEYWORD_BOOST=20`, `IMAGELESS_SCORE_QUANTILE=0.5`,
-  `CONFIDENCE_THRESHOLD=0.6`, `CONFIDENCE_MARGIN=0.25`, `MAX_QUESTIONS=6`, `MIN_INFORMATION_GAIN=0.05`. The comments
+  `CONFIDENCE_THRESHOLD=0.6`, `CONFIDENCE_MARGIN=0.25`, `MAX_QUESTIONS=8`, `MIN_INFORMATION_GAIN=0.05`,
+  `VERIFY_MIN_GAIN=0.15`, `VERIFY_MIN_ODDS=2`, `CONFIRM_UNTIL=0.9`. The comments
   in `config.py` say why.
 
 ## Orientation: north and the street out front (`orientation.py`)
@@ -307,34 +339,87 @@ There is no fixed question list. Each follow-up builds on what the caller has sa
     large rooms.
   - **Darkness:** "dark" counts as evidence that there is no window.
   - **Objects mentioned or denied:** "there's a toilet", "no windows".
-  - **Room names:** as before, named room types boost matching rooms.
+  - **Room names:** only when said as a location ("I'm in the kitchen"). Comparisons ("big like a living room")
+    are ignored, rooms the caller is next to ("near the kitchen") are adjacency evidence, and "not in the bathroom"
+    is a denial (`questions.room_mentions`).
 - **Feature model:** each feature (toilet, shelves, washer, stove, narrow shape, and so on) has a probability
   P(present | candidate), averaged from:
   - **CLIP:** the candidate's photos against the feature prompt, z-scored and passed through a sigmoid.
   - **Room label:** Matterport's classification or label, counted double. A toilet implies a bathroom, which lets
     rooms *without photos* be found.
   - **Geometry:** floor area for size questions; bounding-box aspect ratio for "long and narrow".
+- **Layout model** (`layout.py`): Matterport annotates every wall of a room with typed openings (doorway, window,
+  opening) and their position. From that, per room: which kinds of room its doors lead to (or outside: a door
+  whose far side is outside the floor's footprint; doors to spaces nobody scanned, like a garage or pantry, are
+  "unmapped"), how many windows it has, and which way they face. These are facts about the building, not guesses
+  from photos, so they tell apart rooms that look the same: on the sample house, Bedroom 4 is the only bedroom
+  without a window, only Bathroom 2 has one, and Bedrooms 2 and 3 differ in where their door leads. A layout answer
+  is trusted at 0.88 / 0.12 (`LAYOUT_YES`), a door answer with 30% noise (`DOOR_NOISE`: a room has several doors and
+  we don't know which one the caller means). Cached once per building in `layout.json` (one GraphQL call, no photo
+  re-download). Offline, these questions are simply not offered.
 - **Question kinds:**
-  - **Yes/no:** "Is there a washing machine or dryer?"
-  - **Choice:** "What is the floor like: carpet, tile, or wood?" and "About how big is the room: closet-sized,
-    bedroom-sized, or bigger?" (answered from geometry).
+  - **Yes/no:** "Is there a washing machine or dryer?". Layout ones: "Is there a door in your room that leads
+    straight outside?", "Is there a door from your room straight into a bathroom?", "Is there a closet in your
+    room, with its own door?", and (when the street's direction is known) "From a window in your room, can you see
+    the street in front of the house?"
+  - **Choice:** "What is the floor like: carpet, tile, or wood?" and "About how big is the room: tiny (you can
+    almost touch both walls), medium (a few steps across), or large (lots of open space)?" (answered from
+    geometry). The size question names no rooms: it used to offer "bigger, like a living room", which invited "big
+    like a living room" and was read as a claim. Layout ones: "How many windows does the room have: none, one, or
+    more than one?" and "What is right outside the door of the room you're in: a hallway, a bedroom, ...?" (built
+    per building from the door destinations at least two rooms have). When the street's direction is known: "Is
+    your room at the front of the house (the street side), in the middle, or at the back?", from where the room's
+    centre sits between the back of its floor and the street side (`followups._position_likelihoods`). On 1348 W
+    35th St it is the only thing that tells the three top-floor bedrooms apart: same doors (hallway and their own
+    bathroom), no annotated windows.
   - **Which of these:** a list built from the three features that best separate the rooms still in play, e.g.
     "What can you see around you: shelves or hanging clothes, a washer or dryer, or a toilet, tub or shower?"
 - **Choosing:** the question with the highest expected information gain about the *room*
   (`locator.expected_information_gain`) is asked. Topics the caller already settled (mentioned, answered, or
   "I don't know") are never asked again. A "which of these" list is not asked twice in a row.
+- **Answers it can't read:** a question whose answer couldn't be read is asked once more, starting "Sorry, I didn't
+  catch that." and ending with how to answer ("Just the number is fine (1 is the ground floor)."), then dropped. It
+  is never sent a third time. "I don't know" gets "That's okay." and the next question.
+- **Replies are normalised first** (`questions.normalize`): phones send typographic apostrophes ("Don’t know"),
+  and every reply pattern is written with a plain one. The log shows the text as typed.
+- **Only descriptions are matched against the photos** (`questions.describes_something`): "3", "3rd", "ok" or
+  "what?" used to be scored as room descriptions, and that noise alone could tip the estimate.
 - **Stopping:** if no question is worth `MIN_INFORMATION_GAIN` (0.05 bits), the call stops with a best guess that
   lists the leading rooms, instead of asking irrelevant questions.
+- **Corroboration** (`followups.verification`): a room that passes the confidence rule is not reported yet. The
+  question that best tells "this room" from "anywhere else" is asked first, scored as if the two were equally likely
+  (on the real posterior, a room at 80% leaves nothing to gain and every check looks worthless). The room is
+  confirmed only if the answer multiplied its odds by `VERIFY_MIN_ODDS = 2`: "didn't go down" was not enough, since
+  "Is there a closet?" answered yes "confirmed" Bedroom 3 when the runner-up, Bedroom 2, has a closet too. A
+  contradicting answer moves the estimate and the next check (or question) follows. If nothing in the bank can check
+  the room (`VERIFY_MIN_GAIN`), it is reported flagged as not cross-checked. The dashboard shows "confirmed by a
+  caller answer" or "not yet confirmed".
+- **After "located":** questions continue while the room is under `CONFIRM_UNTIL = 0.9` (answers can still move it,
+  and the caller is told again if the room changes, after its own check), then the "where in the room" questions.
+  Located calls keep reading every reply.
+- **Dispatcher control:** "Ask next best question" asks, in order, a check of an unchecked room, the best room
+  question (any gain above `DISPATCHER_MIN_GAIN`: the dispatcher decided it's worth the caller's time), another
+  check, or a "what's closest" question. They can also type their own question; the reply is read as free text.
+  Neither counts toward `MAX_QUESTIONS`.
 - **Floors (multi-storey buildings):**
   - **Question:** a choice question is built per building, e.g. "Which floor are you on: ground floor, 2nd floor,
     3rd floor, or 4th floor?".
   - **Cues in free text:** "upstairs", "downstairs", "second floor", "top floor", "floor 2". "Upstairs" means
     floor 2 in a two-storey building and any floor above ground in a taller one.
   - **Weight of a floor answer:** `FLOOR_ANSWER_ACCURACY = 0.9`, because callers confuse "first" and "ground".
-  - **Floor first:** the floor question goes first while no floor has `FLOOR_FIRST_UNTIL = 0.8`. Responders act on
-    the floor first, and callers know it.
-  - **Located needs the floor too:** "located" also requires the room's floor to be that likely, so "I'm in the
-    kitchen" in a building with two kitchens on different floors asks for the floor before declaring a location.
+  - **Bare answers:** as the reply to the floor question, "3", "3rd", "third", "the 3rd one" and "top" count.
+    Said anywhere else, a bare number is not a floor ("3 windows").
+  - **Floor first, always:** in a multi-storey building the floor question goes first unless the caller already said
+    it, even when the descriptions favour one floor. Responders act on the floor first, and callers know it.
+  - **"I don't know" the floor:** "Did you go up any stairs to get to the room you're in? If yes, how many
+    flights?" follows while no floor has `FLOOR_FIRST_UNTIL = 0.8`. It is weaker evidence
+    (`STAIRS_ANSWER_ACCURACY = 0.75`: a raised porch, a lower street level, coming down from above).
+  - **Located needs the floor too:** "located" requires the caller to have answered the floor question (or said
+    they don't know) and the room's floor to be at least 80% likely. A live call to 1348 W 35th St reached 80% on
+    Floor 1 from photo matches alone and named a ground-floor bedroom to a caller on the 3rd floor (they had answered
+    "Don’t know", "3" and "3rd", none of which was read).
+  - **Floors named as asked:** the caller is told "Bedroom 6, 3rd floor", using the same names as the floor
+    question, not Matterport's "Floor 3".
 - **Where in the room** (`followups.refinement`): once the room is "located", the system asks up to
   `MAX_REFINEMENTS = 2` "what's closest to you?" questions. The conditions:
   - the room has several photographed scan points;
@@ -402,17 +487,37 @@ against the live API**: no Claude credentials were available. Expect a few secon
 
 ### Evaluation
 
-`backend/scripts/eval_scenarios.py [-v]` runs scripted callers through the real session flow. Their answers come
-from a fact sheet checked against the photos, and `-v` prints each conversation. Current result, with no API key:
-**14/19 top room correct, and none confidently wrong**:
-- 10/15 on the single-floor houses, including 3 of 4 open-ended paraphrases that contain no feature keywords.
-- **4/4 rooms and 4/4 floors** on the 4-floor building.
+`backend/scripts/eval_scenarios.py [-v] [--noisy]` runs scripted callers through the real session flow and answers
+*every* question asked, including the checks before "located" and the questions after it. Photo facts come from a
+fact sheet checked against the photos; layout questions are answered from Matterport's door/window annotation of the
+true room (a caller who knows their doors and windows). That is the same data the model uses, so `--noisy` also runs
+every scenario with 15% of answers wrong (fixed seed). `-v` prints each conversation. Current result, no API key:
 
-Before the "rooms without photos" fix the score was 15/19, but two of the misses were declared "located" in the
-wrong room. Those cases had won only because their closet was the one with a photo. They now end as an honest best
-guess that lists the similar closets.
+| | Top room correct | Ended "located" in a wrong room | Caller ever told a wrong room | Questions per call |
+|---|---|---|---|---|
+| Before this revamp (original 19 scenarios) | 14/19 | 0 | 0 | — |
+| Now, original 19 scenarios | 17/19 | 0 | 0 | |
+| Locating revamp, 25 scenarios, truthful callers | 23/25 | 0 | 0 | 2.6 |
+| Locating revamp, 25 scenarios, 15% wrong answers | 22/25 | 1 | 1 | 3.3 |
+| Now (reply fixes + front/back question), all 27 scenarios, truthful callers | **25/27** | **0** | **0** | 2.8 |
+| Now, all 27 scenarios, 15% wrong answers | 25/27 | 0 | 0 | 3.6 |
+
+- **New scenarios:** "I'm in a bedroom" on the sample house resolved to the right one of four identical empty bedrooms
+  (Bedrooms 2, 3 and 4), "I'm in the bathroom" to the right one of two photo-less bathrooms, "big like a living room"
+  from a bedroom no longer means the living room, and a wrong claim ("I think I'm in the kitchen" from the living
+  room) is caught by its check and corrected.
+- **Live-call scenarios (1348 W 35th St, Bedroom 6, 3rd floor):** "I’m in a bedroom" (curly apostrophe), then the
+  floor as a bare "3", or "I don't know" and then "two flights". Before the fixes this call was told "Bedroom 1,
+  Floor 1". Now both end on Bedroom 6, 3rd floor: located (flagged not cross-checked, 65%) or as a best guess (60%).
+  The front/back answer is what separates it from the other two top-floor bedrooms.
+- **Remaining misses:** both Closet 4 callers at 7921 Pointer St end as an honest best guess among the closets: all
+  four open onto bedrooms, have no windows and look alike. The noisy miss is a Kitchen caller who gave two wrong
+  answers in a row ("mirror: yes", "toilet: yes").
+- 4/4 rooms and floors on the 4-floor building.
 
 It needs the three buildings cached; it ingests them on first run, which takes several minutes.
+
+The table below is the per-scenario result **before** this revamp, kept for comparison.
 
 | Building | Caller is in | Opening | Result |
 |---|---|---|---|
@@ -497,7 +602,7 @@ cd dashboard && npm install && npm run dev        # http://localhost:5173
 cd messaging && npm start                         # no dependencies; the caller's phone must text the shared line first
 ```
 
-Tests: `cd backend && .venv/Scripts/python -m pytest` (44 tests). `test_semantics.py` downloads the ~90 MB
+Tests: `cd backend && .venv/Scripts/python -m pytest` (60 tests). `test_semantics.py` downloads the ~90 MB
 paraphrase model on first run; the rest need no network.
 Scenario check: `cd backend && .venv/Scripts/python scripts/eval_scenarios.py [-v]` (ingests the three test
 buildings on first run).
@@ -527,7 +632,11 @@ buildings on first run).
   can't place the caller between scan points beyond that, or in rooms without photos.
 - Rooms without photos are scored like the photographed rooms of the same type, so they can't be told apart from
   each other (or from their photographed sibling) by appearance; floor, size and room-type words separate them.
-- Visually similar rooms (the sample's empty bedrooms) are confused, sometimes with high confidence.
+- Rooms with the same layout and look (Pointer St's four bedroom closets) still can't be told apart; the call ends
+  as a best guess naming them.
+- Layout answers assume Matterport's door/window annotation is right. A door that wasn't annotated, or a window drawn
+  on the wrong wall, misleads those questions (each answer is capped at ~7x evidence for this reason).
+- A check before "located" costs the caller one more text. The dashboard shows the leading room meanwhile.
 - Without `ANTHROPIC_API_KEY`, follow-ups use templates, and replies are read by keywords plus paraphrase matching
   against fixed example phrasings. Phrasing far from those examples is only understood through CLIP. The
   optional Claude layer is untested live.

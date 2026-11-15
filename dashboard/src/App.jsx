@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { getBuilding, getConfig, getRoomShots, getSessions, sendReply, startCall, subscribe } from "./api.js";
+import { askQuestion, getBuilding, getConfig, getRoomShots, getSessions, sendReply, startCall, subscribe } from "./api.js";
 import FloorPlan from "./FloorPlan.jsx";
 
 const DEMO_ADDRESS = "13122 Chipman Glen Dr, Houston, TX";
@@ -7,7 +7,8 @@ const STATUS_LABELS = {
   loading: "Loading building",
   listening: "Locating",
   located: "Located",
-  best_guess: "Best guess",
+  best_guess: "Approximate",
+  out: "Out of building",
   no_model: "No interior model",
   error: "Error",
 };
@@ -61,19 +62,18 @@ export default function App() {
     <div className="app">
       <header className="topbar">
         <h1>Caller Locator</h1>
-        <div className="topbar-meta">
+        <dl className="topbar-meta">
           {config && (
-            <span className="badge" title="How messages reach the caller">
-              {config.messaging_mode === "photon" ? "iMessage via Photon" : "Simulated caller"}
-            </span>
+            <>
+              <dt>Texts</dt>
+              <dd>{config.messaging_mode === "photon" ? "iMessage (Photon)" : "Simulated"}</dd>
+              <dt>Replies read by</dt>
+              <dd>{config.followups === "claude" ? "Claude" : "Keyword rules"}</dd>
+            </>
           )}
-          {config && (
-            <span className="badge" title="Who reads replies and words follow-up questions">
-              {config.followups === "claude" ? "Follow-ups: Claude" : "Follow-ups: keyword rules"}
-            </span>
-          )}
-          <span className={`conn ${connected ? "on" : "off"}`}>{connected ? "Live" : "Reconnecting…"}</span>
-        </div>
+          <dt>Server</dt>
+          <dd className={connected ? "ok" : "warn"}>{connected ? "Connected" : "Reconnecting"}</dd>
+        </dl>
       </header>
 
       <aside className="sidebar">
@@ -84,11 +84,16 @@ export default function App() {
           {ordered.length === 0 && <li className="muted">No calls yet.</li>}
           {ordered.map((s) => (
             <li key={s.id}>
-              <button className={s.id === selected?.id ? "session active" : "session"} onClick={() => setSelectedId(s.id)}>
+              <button
+                className={s.id === selected?.id ? `session status-${s.status} active` : `session status-${s.status}`}
+                onClick={() => setSelectedId(s.id)}
+              >
                 <span className="session-address">{s.address}</span>
                 <span className="session-meta">
-                  {s.phone} · <StatusPill status={s.status} />
+                  <span>{s.phone}</span>
+                  <span>{clock(s.created)}</span>
                 </span>
+                <Status status={s.status} />
               </button>
             </li>
           ))}
@@ -99,7 +104,7 @@ export default function App() {
         {selected ? (
           <SessionView session={selected} building={buildings[selected.model_id]} config={config} />
         ) : (
-          <div className="empty">Start a simulated 911 call to begin.</div>
+          <div className="empty">No active call. Enter the caller's phone and address to start.</div>
         )}
       </main>
     </div>
@@ -124,7 +129,7 @@ function CallForm({ defaultPhone, onSubmit }) {
         setBusy(false);
       }}
     >
-      <h2>Incoming 911 call</h2>
+      <h2>New call</h2>
       <label>
         Caller phone
         <input value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="+1 609 555 0100" required />
@@ -140,8 +145,55 @@ function CallForm({ defaultPhone, onSubmit }) {
   );
 }
 
-function StatusPill({ status }) {
-  return <span className={`pill pill-${status}`}>{STATUS_LABELS[status] || status}</span>;
+function Status({ status }) {
+  return <span className={`status status-${status}`}>{STATUS_LABELS[status] || status}</span>;
+}
+
+// The one thing the dispatcher needs first: which room and floor, and how sure the system is.
+function LocationSummary({ session, multiFloor }) {
+  const estimate = session.estimate;
+  const shown = estimate && (session.status === "located" || session.status === "best_guess" || session.questions_asked > 0);
+  let where = "Not known yet";
+  let label = "Caller location";
+  if (session.status === "out") where = "Caller is out of the building";
+  else if (shown) {
+    where = multiFloor ? `${estimate.room_name}, ${estimate.floor_label}` : estimate.room_name;
+    // Don't let a 47% guess read like a confirmed room.
+    if (session.status === "best_guess") label = "Approximate location";
+    else if (session.status !== "located") label = "Most likely so far (not confirmed)";
+  }
+
+  return (
+    <section className={`summary status-${session.status}`}>
+      <div className="summary-main">
+        <span className="summary-label">{label}</span>
+        <span className={["located", "out"].includes(session.status) ? "summary-where" : "summary-where tentative"}>{where}</span>
+        <span className="summary-detail">
+          <Status status={session.status} />
+          {shown && session.status !== "out" && (
+            <>
+              {" "}· {pct(estimate.room_probability)} likely (next {pct(estimate.runner_up_probability)}) ·{" "}
+              {estimate.checked ? "confirmed by a caller answer" : "not yet confirmed"} · position ±
+              {estimate.radius_m?.toFixed(1)} m
+            </>
+          )}
+        </span>
+        {session.danger && <span className="danger">Caller reported smoke, fire, or trouble breathing</span>}
+      </div>
+      <dl className="summary-facts">
+        <dt>Address</dt>
+        <dd>{session.match?.address || session.address}</dd>
+        <dt>Phone</dt>
+        <dd>{session.phone}</dd>
+        <dt>Questions sent</dt>
+        <dd>
+          {session.questions_asked} of {session.max_questions}
+        </dd>
+        <dt>Note</dt>
+        <dd>{session.status_detail}</dd>
+      </dl>
+    </section>
+  );
 }
 
 function SessionView({ session, building, config }) {
@@ -150,9 +202,12 @@ function SessionView({ session, building, config }) {
   const [pickedRoom, setPickedRoom] = useState(null);
   // Floor shown on the plan; null follows the floor of the current best estimate.
   const [pickedFloor, setPickedFloor] = useState(null);
+  // Scan point clicked on the plan; its photos are shown first. null when a room (not a dot) was picked.
+  const [pickedSweep, setPickedSweep] = useState(null);
   useEffect(() => {
     setPickedRoom(null);
     setPickedFloor(null);
+    setPickedSweep(null);
   }, [session.id]);
   const estimate = session.estimate;
   const shownRoom = pickedRoom ?? estimate?.room ?? null;
@@ -162,35 +217,24 @@ function SessionView({ session, building, config }) {
 
   function pickRoom(index) {
     setPickedRoom(index);
+    setPickedSweep(null);
     const room = session.rooms.find((r) => r.index === index);
     if (room) setPickedFloor(room.floor); // show the floor the room is on
   }
 
+  function pickSweep(candidate, roomIndex) {
+    pickRoom(roomIndex);
+    setPickedSweep(candidate);
+  }
+
   return (
     <div className="session-view">
-      <section className="status-bar">
-        <div>
-          <StatusPill status={session.status} />
-          <span className="status-detail">{session.status_detail}</span>
-        </div>
-        <div className="status-numbers">
-          <span>
-            Questions {session.questions_asked}/{session.max_questions}
-          </span>
-          {estimate && (
-            <span>
-              Top room <strong>{estimate.room_name}</strong>
-              {multiFloor ? ` (${estimate.floor_label})` : ""} {pct(estimate.room_probability)} (next{" "}
-              {pct(estimate.runner_up_probability)}) · spot ±{estimate.radius_m?.toFixed(1)} m
-            </span>
-          )}
-        </div>
-      </section>
+      <LocationSummary session={session} multiFloor={multiFloor} />
 
       <section className="panel plan-panel">
         <div className="panel-head">
           <div>
-            <h2>{building ? building.address : session.address}</h2>
+            <h2>Floor plan</h2>
             <MatchNote session={session} />
           </div>
           {floorplan && (
@@ -217,6 +261,8 @@ function SessionView({ session, building, config }) {
             showPhoto={showPhoto}
             selectedRoom={shownRoom}
             onSelectRoom={pickRoom}
+            selectedSweep={pickedSweep}
+            onSelectSweep={pickSweep}
           />
         ) : (
           <div className="plan-placeholder">
@@ -229,20 +275,25 @@ function SessionView({ session, building, config }) {
           <RoomPhotos
             session={session}
             roomIndex={shownRoom}
+            sweep={pickedSweep}
             followsEstimate={pickedRoom === null}
-            onFollowEstimate={() => setPickedRoom(null)}
+            onFollowEstimate={() => {
+              setPickedRoom(null);
+              setPickedSweep(null);
+            }}
           />
         )}
       </section>
 
       <section className="panel conversation-panel">
-        <h2>Conversation</h2>
+        <h2>Texts with caller</h2>
         <Conversation messages={session.messages} />
+        <DispatcherAsk session={session} />
         <CallerBox session={session} mode={config?.messaging_mode} />
       </section>
 
       <section className="panel rooms-panel">
-        <h2>Room probabilities</h2>
+        <h2>Rooms, most likely first</h2>
         {session.rooms.length === 0 ? (
           <p className="muted">Waiting for the building to load.</p>
         ) : (
@@ -275,10 +326,15 @@ function SessionView({ session, building, config }) {
 
 // Every photo of one room, grouped by scan point, from GET /api/sessions/{id}/rooms. Photos don't change during a
 // call, so they are fetched once per session/building; probabilities come from the live session snapshot.
-function RoomPhotos({ session, roomIndex, followsEstimate, onFollowEstimate }) {
+function RoomPhotos({ session, roomIndex, sweep, followsEstimate, onFollowEstimate }) {
   const [rooms, setRooms] = useState(null);
   const [error, setError] = useState("");
   const ready = session.rooms.length > 0;
+  const clickedRef = useRef(null);
+  // The gallery is below the plan, so bring a clicked point's photos into view.
+  useEffect(() => {
+    if (sweep !== null) clickedRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }, [sweep, rooms]);
   useEffect(() => {
     if (!ready) return;
     setRooms(null);
@@ -292,35 +348,48 @@ function RoomPhotos({ session, roomIndex, followsEstimate, onFollowEstimate }) {
   const room = rooms.find((r) => r.index === roomIndex);
   if (!room) return null;
   const live = session.rooms.find((r) => r.index === roomIndex);
+  // A dot clicked on the plan: its photos go first. Numbers stay in the room's order, so "3 of 5" names the same
+  // point before and after the click.
+  const numbered = room.sweeps.map((s, i) => ({ ...s, number: i + 1 }));
+  const clicked = numbered.find((s) => s.candidate === sweep);
+  const sweeps = clicked ? [clicked, ...numbered.filter((s) => s !== clicked)] : numbered;
 
   return (
     <div className="views">
       <div className="views-head">
         <h3>
-          {room.name} · {pct(live?.probability)}
+          Photos: {room.name} ({pct(live?.probability)})
           {room.area_m2 ? ` · ${room.area_m2} m²` : ""}
-          {followsEstimate ? " (most likely room)" : ""}
         </h3>
         {!followsEstimate && (
           <button type="button" className="link" onClick={onFollowEstimate}>
-            Back to most likely room
+            Show most likely room
           </button>
         )}
       </div>
+      {sweep !== null && !clicked && room.sweeps.length > 0 && (
+        <p className="muted">No photos were taken at the scan point you clicked.</p>
+      )}
       {room.sweeps.length === 0 ? (
-        <p className="muted">No photos were taken in this room. It can only be identified from what the caller says.</p>
+        <p className="muted">No photos of this room. It can only be found from what the caller says.</p>
       ) : (
-        room.sweeps.map((sweep, i) => (
-          <div key={sweep.candidate} className="sweep-shots">
+        sweeps.map((s) => (
+          <div
+            key={s.candidate}
+            ref={s === clicked ? clickedRef : undefined}
+            className={s === clicked ? "sweep-shots clicked" : "sweep-shots"}
+          >
             <span className="muted">
-              {i === 0 && followsEstimate && room.sweeps.length > 1
-                ? `Most likely spot (${pct(liveScan(session, sweep.candidate))})`
-                : `Scan point ${i + 1} of ${room.sweeps.length}`}
+              Scan point {s.number} of {room.sweeps.length}
+              {s === clicked ? ` (clicked on the plan, ${pct(liveScan(session, s.candidate))})` : ""}
+              {!clicked && s.number === 1 && followsEstimate && room.sweeps.length > 1
+                ? `: caller most likely here (${pct(liveScan(session, s.candidate))})`
+                : ""}
             </span>
             <div className="view-strip">
-              {sweep.views.map((url) => (
+              {s.views.map((url) => (
                 <a key={url} href={url} target="_blank" rel="noreferrer">
-                  <img src={url} alt={`${room.name}, scan point ${i + 1}`} loading="lazy" />
+                  <img src={url} alt={`${room.name}, scan point ${s.number}`} loading="lazy" />
                 </a>
               ))}
             </div>
@@ -361,22 +430,83 @@ const liveScan = (session, candidate) => session.candidate_probabilities?.[candi
 function MatchNote({ session }) {
   const match = session.match;
   if (!match) return null;
-  if (match.exact) return <p className="match match-exact">Exact address match</p>;
+  if (match.exact) return <p className="match">{match.address} (exact address match)</p>;
   return (
     <p className="match match-approx" title={`Caller address: ${session.address}`}>
-      Closest match to “{session.address}” · {pct(match.score)} similar. Confirm with the caller.
+      Not an exact match. Using {match.address} ({pct(match.score)} similar to “{session.address}”). Confirm with the
+      caller.
     </p>
   );
 }
 
+const WHO = { dispatch: "Sent", caller: "Caller", system: "Note" };
+
+// The dispatcher keeps questioning at any point, including after the call is located: either the system's next best
+// question (a check of the room, then whatever best separates the likely rooms, then where in the room) or their own.
+function DispatcherAsk({ session }) {
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [problem, setProblem] = useState("");
+  const open = ["listening", "located", "best_guess"].includes(session.status);
+  useEffect(() => {
+    setProblem("");
+  }, [session.id]);
+
+  async function ask(value) {
+    setBusy(true);
+    setProblem("");
+    try {
+      await askQuestion(session.id, value);
+      setText("");
+    } catch (e) {
+      setProblem(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <form
+      className="dispatcher-ask"
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (text.trim()) ask(text);
+      }}
+    >
+      <div className="dispatcher-row">
+        <button type="button" className="primary" disabled={!open || busy} onClick={() => ask("")}>
+          Ask next best question
+        </button>
+        <input
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          placeholder={open ? "Or type your own question to the caller" : "Call is not taking questions"}
+          disabled={!open || busy}
+          aria-label="Your own question to the caller"
+        />
+        <button type="submit" disabled={!open || busy || !text.trim()}>
+          Send
+        </button>
+      </div>
+      {problem && <p className="muted">{problem}</p>}
+    </form>
+  );
+}
+
+// Plain log, oldest first, with send/receive times, like a dispatch record.
 function Conversation({ messages }) {
   const end = useRef(null);
-  useEffect(() => end.current?.scrollIntoView({ block: "end" }), [messages.length]);
+  // Braces matter: current Chromium returns a Promise from scrollIntoView, and an effect that returns a value has it
+  // called as a cleanup function, which crashed the log ("destroy is not a function") on every new message.
+  useEffect(() => {
+    end.current?.scrollIntoView({ block: "end" });
+  }, [messages.length]);
   return (
     <ol className="messages">
       {messages.map((m, i) => (
         <li key={i} className={`msg msg-${m.role}`}>
-          <span className="msg-who">{m.role === "dispatch" ? "To caller" : m.role === "caller" ? "Caller" : "System"}</span>
+          <span className="msg-time">{m.ts ? clock(m.ts) : ""}</span>
+          <span className="msg-who">{m.source === "dispatcher" ? "You" : WHO[m.role] || m.role}</span>
           <span className="msg-text">{m.text}</span>
         </li>
       ))}
@@ -388,8 +518,9 @@ function Conversation({ messages }) {
 function CallerBox({ session, mode }) {
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
-  const open = session.status === "listening" || session.status === "loading";
-  const quick = ["Yes", "No", "I don't know"];
+  // A located call still takes replies ("I moved", "I'm out").
+  const open = ["listening", "loading", "located", "best_guess"].includes(session.status);
+  const quick = ["Yes", "No", "I don't know", "OUT"];
 
   async function send(value) {
     if (!value.trim()) return;
@@ -411,7 +542,7 @@ function CallerBox({ session, mode }) {
       }}
     >
       <label htmlFor="caller-input">
-        Simulated caller reply{mode === "photon" ? " (overrides iMessage for testing)" : ""}
+        Type a reply as the caller{mode === "photon" ? " (testing; real replies arrive by iMessage)" : ""}
       </label>
       <div className="caller-row">
         <input
@@ -437,3 +568,5 @@ function CallerBox({ session, mode }) {
 }
 
 const pct = (p) => `${Math.round((p || 0) * 100)}%`;
+// Backend timestamps are Unix seconds.
+const clock = (ts) => new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });

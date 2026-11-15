@@ -6,7 +6,8 @@ import React, { useMemo } from "react";
 // upright. SVG y grows downward and model y grows upward, so y is negated.
 // The schematic comes from room wall segments because Matterport's raster floorplans are aerial photos of the roof.
 // Only `floor` is drawn; the view box covers every floor so the scale doesn't jump when switching floors.
-export default function FloorPlan({ building, session, floor = 0, showPhoto, selectedRoom, onSelectRoom }) {
+export default function FloorPlan({ building, session, floor = 0, showPhoto, selectedRoom, onSelectRoom, selectedSweep,
+                                    onSelectSweep }) {
   const orientation = building.orientation;
   const yawDeg = orientation?.yaw_deg ?? 0;
   const P = useMemo(() => makeProjector(yawDeg), [yawDeg]);
@@ -19,7 +20,8 @@ export default function FloorPlan({ building, session, floor = 0, showPhoto, sel
 
   const estimate = session?.estimate;
   const located = session?.status === "located";
-  const showEstimate = estimate && (estimate.floor ?? 0) === floor &&
+  // No dot once the caller has said they're out: it would send responders to an empty room.
+  const showEstimate = estimate && (estimate.floor ?? 0) === floor && session?.status !== "out" &&
     (located || session?.status === "best_guess" || session?.questions_asked > 0);
   const fp = building.floorplans?.[String(floor)];
   const onFloor = (room) => (room.floor ?? 0) === floor;
@@ -97,9 +99,19 @@ export default function FloorPlan({ building, session, floor = 0, showPhoto, sel
       })}
       {(session?.candidate_probabilities || []).map((p, i) => {
         const c = building.candidates[i];
-        if (!onFloor(building.rooms[roomIndex[c.room_id]])) return null;
+        const room = roomIndex[c.room_id];
+        if (!onFloor(building.rooms[room])) return null;
         const [cx, cy] = P(c.x, c.y);
-        return <circle key={c.id} cx={cx} cy={cy} r={0.12 + 0.35 * Math.sqrt(p)} className="sweep" />;
+        const selected = selectedSweep === i;
+        return (
+          // Scan points are clickable to show their photos. The visible dot can be 0.12 m across, so a larger
+          // transparent circle takes the clicks.
+          <g key={c.id} className="sweep-target" onClick={() => onSelectSweep?.(i, room)}>
+            <circle cx={cx} cy={cy} r={Math.max(0.45, 0.12 + 0.35 * Math.sqrt(p))} className="sweep-hit" />
+            <circle cx={cx} cy={cy} r={0.12 + 0.35 * Math.sqrt(p)} className={selected ? "sweep selected" : "sweep"} />
+            <title>{`${building.rooms[room]?.name}: scan point (${Math.round(p * 100)}%). Click to see its photos`}</title>
+          </g>
+        );
       })}
       {showEstimate && <Marker at={P(estimate.x, estimate.y)} radius={estimate.radius_m} located={located} />}
       {orientation && <Compass x={view.x + 1.6} y={view.y + 1.8} />}

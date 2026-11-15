@@ -216,4 +216,8 @@ ADDRESS_CLARIFY_MARGIN = 0.10
 ADDRESS_CATALOG_CANDIDATES = 60
 # ---- B: intake and handoff (sessions.py, handoff.py, main.py)
 # ---- C: caller language (questions.py, semantics.py)
+# questions.looks_like_address: how many words a street name may have between the house number and the street
+# word ("13122 Chipman Glen Dr" is 2). Larger accepts longer names but also more sentences that merely contain a
+# number ("2 people are in the back bedroom by the door").
+ADDRESS_MAX_NAME_WORDS = 4
 # ---- D: voice and platform (voice.py, phones.py, .env loading)

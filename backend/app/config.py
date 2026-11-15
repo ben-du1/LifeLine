@@ -3,21 +3,23 @@
 import os
 from pathlib import Path
 
+from dotenv import dotenv_values
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = REPO_ROOT / "data"
 BUILDINGS_DIR = DATA_DIR / "buildings"
 
 
 def _load_dotenv(path: Path) -> None:
-    # Tiny .env reader so we don't need python-dotenv. Real environment variables win.
+    # python-dotenv parses quotes, `export` and comments the way the Node tools (--env-file) do. For a key listed
+    # twice the last value wins: the old reader kept the first, so a blank `VOICE_TOOL_TOKEN=` above the real one
+    # (left by an earlier setup run) shadowed it. Real environment variables still win. No ${VAR} expansion, so a
+    # secret containing "$" is read as written.
     if not path.exists():
         return
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip())
+    for key, value in dotenv_values(path, interpolate=False, encoding="utf-8").items():
+        if value is not None:   # a bare "NAME" line with no "=" sets nothing
+            os.environ.setdefault(key, value)
 
 
 _load_dotenv(REPO_ROOT / ".env")
@@ -206,3 +208,10 @@ GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "")
 # ---- B: intake and handoff (sessions.py, handoff.py, main.py)
 # ---- C: caller language (questions.py, semantics.py)
 # ---- D: voice and platform (voice.py, phones.py, .env loading)
+# A voice interview ends after this long even if the caller is still talking (the post-call webhook and the agent's
+# end_call tool normally end it first). 240 s was enough for room questions alone; the address intake (a retry or a
+# "Did you mean...?") adds about a minute, hence 300.
+VOICE_INTERVIEW_SECONDS = 300
+# How long the agent may keep a caller on "still loading the building" before the bridge gives up. Counted from the
+# moment the address resolves, not from the start of the call, so intake questions don't use it up.
+VOICE_LOADING_SECONDS = 60

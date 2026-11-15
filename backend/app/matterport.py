@@ -88,7 +88,10 @@ def rank_matches(address: str, models: list[dict]) -> list[dict]:
     for model in models:
         # Some models carry the address only in the name ("7921 Pointer St"), so the better of the two counts. The
         # full address field is still what the dispatcher sees, since it includes the city.
-        texts = [t for t in (model["address"], model["name"]) if t]
+        # The name is scored with the address field's city/state/ZIP attached: on its own, the name "2810 Princeton
+        # St" (a Houston model) had no locality to contradict "Princeton, NJ 08544" and scored a perfect 1.0, which
+        # beat the real Princeton model on the tie because it was cached.
+        texts = [t for t in (model["address"], addresses.with_locality(model["name"], model["address"])) if t]
         score = max((addresses.similarity(address, t) for t in texts), default=0.0)
         if score >= config.ADDRESS_MATCH_THRESHOLD:
             scored.append({**model, "address": model["address"] or model["name"], "score": round(score, 3),

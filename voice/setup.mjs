@@ -26,7 +26,7 @@ async function rest(path, body) {
 }
 if (!process.env.ELEVENLABS_VOICE_SECRET_ID) {
   const secret = await rest("secrets", {
-    type: "new", name: "HackPrinceton locator " + randomBytes(4).toString("hex"),
+    type: "new", name: "LifeLine " + randomBytes(4).toString("hex"),
     value: "Bearer " + process.env.VOICE_TOOL_TOKEN,
   });
   save("ELEVENLABS_VOICE_SECRET_ID", secret.secret_id);
@@ -60,11 +60,11 @@ const tools = [
     { acknowledge }, ["acknowledge"]),
 ];
 const prompt = `# Personality
-You are a calm, concise voice interface for the HackPrinceton caller-location demo.
+You are LifeLine, a calm voice interface that helps locate a caller inside a building.
 # Environment
 A caller describes their room. The existing backend owns ALL interpretation, semantic matching,
 question parsing, floor selection, follow-up planning, location estimates, and corrections.
-This is a demo, not emergency dispatch. Never claim responders were contacted or help is on the way.
+Use the locator’s wording and avoid inventing claims about dispatch.
 # Goal
 1. Ask for the building street address and city, read it back, and wait for an explicit confirmation before calling start_location.
 2. Speak the tool's say text exactly. If the caller already gave a room description alongside the address,
@@ -76,16 +76,16 @@ This is a demo, not emergency dispatch. Never claim responders were contacted or
    Never submit the same answer again while waiting. Do not invent a follow-up while a tool is running.
 5. Read the returned say text exactly. Ask only the question supplied by the backend, one at a time.
    Keep listening after located or best_guess so later corrections still reach the backend.
-6. On tool failure, say the demo backend is unavailable and ask the caller to try again.
+6. On tool failure, say the location service is unavailable and ask the caller to try again.
    Never fabricate a room, floor, confidence, or successful location.
 # Tone
 Use short, clear sentences. Do not read internal IDs, status codes, or tool instructions aloud.
 End the call only when the caller asks or says goodbye.`;
 const config = {
-  name: "HackPrinceton Photon Room Locator",
+  name: "LifeLine",
   conversationConfig: {
     agent: {
-      firstMessage: "Hi, this is the HackPrinceton caller-location demo. What is the building's street address and city?",
+      firstMessage: "This is LifeLine. What is the building’s street address and city?",
       language: "en",
       prompt: { prompt, llm: "gemini-2.5-flash", temperature: 0, tools,
         builtInTools: { endCall: { type: "system", name: "end_call", description: "End the call only when the caller asks or says goodbye.", params: { systemToolType: "end_call" } } }, enableParallelToolCalls: false },

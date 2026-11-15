@@ -68,10 +68,11 @@ def room_probs(session):
     return locator.room_probabilities(session.posterior, np.arange(5), 5)
 
 
-def test_naming_the_only_kitchen_locates_in_one_message(monkeypatch):
+def test_naming_the_only_kitchen_leads_to_verification(monkeypatch):
     manager, session = make_manager(monkeypatch, embedding=np.zeros(4, dtype=np.float32))
     asyncio.run(manager.handle_reply(session, "I'm in the kitchen"))
-    assert session.status == "located" and session.estimate.room == 4
+    assert session.status == "listening" and session.estimate.room == 4
+    assert session.pending.purpose == "verify"
     assert session.evidence_messages == 1 and 0 < room_probs(session).min() and room_probs(session).max() < 1
 
 
@@ -92,7 +93,8 @@ def test_one_strong_photo_match_needs_a_second_message(monkeypatch):
     else:
         answer = followups.FEATURES_BY_KEY[plan.items[int(np.argmax(p_kitchen[:-1]))]].noun
     asyncio.run(manager.handle_reply(session, answer))
-    assert session.status == "located" and session.estimate.room == 4 and session.evidence_messages == 2
+    assert session.estimate.room == 4 and session.evidence_messages == 2
+    assert session.status == "located" or session.pending.purpose == "verify"
 
 def test_two_bedrooms_are_not_located_on_a_bed(monkeypatch):
     manager, session = make_manager(monkeypatch, embedding=np.zeros(4, dtype=np.float32))

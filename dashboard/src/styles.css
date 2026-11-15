@@ -387,3 +387,57 @@ button.floor-tab.active { border-color: var(--room); background: var(--bg); font
   color: var(--muted);
   font-size: 0.75rem;
 }
+
+/* Shared spacing and hierarchy for the call workspace. */
+:root {
+  --space-1: 6px;
+  --space-2: 12px;
+  --space-3: 20px;
+  --space-4: 28px;
+}
+.sidebar .side-title { font-size: 0.7rem; margin: 0; }
+.sidebar > .side-title { margin: var(--space-4) 0 var(--space-2); border-top: 1px solid var(--border); padding-top: var(--space-3); }
+.sidebar .call-form { gap: var(--space-2); }
+.panel { gap: var(--space-2); padding: var(--space-3); }
+.session-view { grid-template-areas: "status status" "plan conversation" "plan rooms"; gap: var(--space-3); }
+.incident {
+  grid-area: status;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--space-1) var(--space-3);
+  align-items: start;
+  padding: 0 0 var(--space-2);
+  border-bottom: 1px solid var(--border);
+}
+.incident-room { margin-top: var(--space-1); font-size: clamp(1.15rem, 2vw, 1.65rem); font-weight: 600; letter-spacing: -0.045em; }
+.incident-none, .incident-zone, .incident-floor { font-size: 0.8rem; color: var(--muted); font-weight: 500; letter-spacing: 0; }
+.incident-floor { display: block; margin-top: var(--space-1); }
+.incident-odds { display: grid; gap: var(--space-1); justify-items: end; }
+.incident-pct { font-size: 1.55rem; font-weight: 600; letter-spacing: -0.04em; }
+.check-first { grid-column: 1 / -1; color: var(--warn); font-size: 0.8rem; }
+.panel-head { flex-wrap: wrap; gap: var(--space-2); }
+.panel-head > div:first-child { flex: 1 1 260px; }
+.panel-tools { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+.segmented { display: inline-flex; }
+.segmented button { min-width: 52px; }
+.segmented button + button { margin-left: -1px; }
+.segmented button.active { background: var(--rail); border-color: var(--room); z-index: 1; }
+.floor-tabs button, .plan-tools button, .segmented button, .quick button { min-height: 32px; padding: 6px 10px; }
+.views { padding-top: var(--space-2); border-top: 1px solid var(--border); }
+.views-sub { color: var(--muted); font-size: 0.75rem; font-weight: 500; }
+.msg-who { display: block; margin-bottom: 2px; }
+.map-wrap, .address-map { background: var(--map); }
+@media (max-width: 1000px) {
+  .session-view { grid-template-areas: "status" "plan" "conversation" "rooms"; }
+}
+
+.plan-controls { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); flex-wrap: wrap; }
+.plan-controls:empty { display: none; }
+.plan-controls .panel-tools { order: 1; }
+.plan-controls .panel-tools:empty { display: none; }
+.room-badge { font-size: 0.68rem; color: var(--muted); }
+.room-name-text { display: flex; flex-wrap: wrap; gap: 4px; }
+@media (max-width: 680px) {
+  .plan-controls .panel-tools { order: 0; }
+  .panel { padding: 14px; }
+}

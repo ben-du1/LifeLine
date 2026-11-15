@@ -57,6 +57,10 @@ class ReplyIn(BaseModel):
     text: str
 
 
+class AskIn(BaseModel):
+    text: str | None = None   # the dispatcher's own question; empty: the system picks the next best one
+
+
 class InboundIn(BaseModel):
     event_id: str | None = None
     sender: str = Field(alias="from")  # "from" is a Python keyword
@@ -133,6 +137,18 @@ def get_session_rooms(session_id: str) -> dict:
 async def simulated_reply(session_id: str, body: ReplyIn) -> dict:
     session = _session_or_404(session_id)
     await manager.handle_reply(session, body.text)
+    return manager.snapshot(session)
+
+
+@app.post("/api/sessions/{session_id}/ask")
+async def ask(session_id: str, body: AskIn) -> dict:
+    """The dispatcher asks another question at any point, including after the call is located."""
+    session = _session_or_404(session_id)
+    async with session.lock:
+        problem = await (manager.ask_custom(session, body.text) if body.text and body.text.strip()
+                         else manager.ask_next(session))
+    if problem:
+        raise HTTPException(409, problem)
     return manager.snapshot(session)
 
 

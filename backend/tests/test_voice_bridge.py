@@ -6,7 +6,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from app.voice import VoiceBridge, VoiceError, latest_reply, spoken_message
+from app.voice import VoiceBridge, VoiceError, latest_reply
 
 
 def history(*messages):
@@ -82,10 +82,6 @@ class VoiceBridgeTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(VoiceError):
                 latest_reply(invalid)
         self.assertEqual(latest_reply(history("yes", "no")), (2, "no"))
-        self.assertNotIn("911", spoken_message(
-            "This is 911 emergency services. We're working to find you inside the building."))
-        self.assertNotIn("help is on the way", spoken_message(
-            "Responders now know which room you're in (Bedroom). Stay where you are; help is on the way."))
 
 
 if __name__ == "__main__":

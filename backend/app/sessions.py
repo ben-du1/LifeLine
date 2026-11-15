@@ -2,12 +2,11 @@
 
 Status flow:  loading -> listening -> located | best_guess
               loading -> no_model | error
+              any -> out, when the caller texts that they got out of the building
 Replies that arrive while the building is still loading are queued and processed once it is ready.
 """
 
 import asyncio
-import re
-import dataclasses
 import json
 import logging
 import time
@@ -18,15 +17,13 @@ from typing import Awaitable, Callable
 import httpx
 import numpy as np
 
-from . import approach, config, embeddings, followups, geo, ingest, llm, locator, matterport, messaging, orientation, questions, semantics
-from . import adjacency, subroom, textmatch, ties
+from . import (config, embeddings, followups, ingest, layout, llm, locator, matterport, messaging, orientation,
+               questions, semantics)
 from .building import Building
 from .addresses import is_exact, similarity
-from .voice import spoken_message
+from . import approach, geo, subroom, ties, adjacency, textmatch
 
 log = logging.getLogger(__name__)
-
-EVIDENCE_LOG_LENGTH = 20   # caller messages kept in snapshot["evidence"]; a call rarely has more than 8
 
 
 @dataclass
@@ -57,31 +54,36 @@ class Session:
     ended: bool = False
     waiting_for_match: bool = False
     ledger: list[Evidence] = field(default_factory=list)
-    floor_unresolved: bool = False
-    floor_retry_used: bool = False
     confirmed_floor: int | None = None
-    evidence_texts: set[str] = field(default_factory=set)
     provider_events: set[str] = field(default_factory=set)
+    requested_model: str | None = None
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
+    evidence_messages: int = 0    # caller messages that moved the posterior; "located" needs enough (is_located)
+    within_room_asked: int = 0   # within-room follow-ups asked after the room was found (subroom.py)
+    evidence: list[dict] = field(default_factory=list)   # how each caller message moved the room probabilities
     status: str = "loading"
     status_detail: str = "Looking up the address..."
     model_id: str | None = None
-    # A model the dispatcher picked from the address suggestions: used as-is, since one address can have several
-    # models (apartment units), and matching by address alone would pick any of them.
-    requested_model: str | None = None
     match: dict | None = None     # the Matterport property used: {id, name, address, score, exact}
     messages: list[dict] = field(default_factory=list)
     posterior: np.ndarray | None = None
     asked: list[followups.Plan] = field(default_factory=list)   # follow-ups, in the order asked
     pending: followups.Plan | None = None                        # the follow-up awaiting an answer
     covered: set[str] = field(default_factory=set)               # topics settled; never asked about again
+    refined: list[followups.Plan] = field(default_factory=list)  # "what's closest to you?" questions asked
     queued: list[str] = field(default_factory=list)
-    # One caller message at a time: _process awaits (CLIP, Claude), and two replies processed at once both read the
-    # same pending question and both can send "located" (audit #4).
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
+    extra_asked: list[followups.Plan] = field(default_factory=list)  # asked at the dispatcher's request
+    misses: dict[str, int] = field(default_factory=dict)  # per question: answers we couldn't read
+    last_key: str | None = None        # key of the last question sent (a re-ask says "Sorry, I didn't catch that")
+    verified_room: int | None = None   # the leading room once an independent answer corroborated it
+    unverified: bool = False           # located without a check (nothing in the question bank could check it)
+    safety_sent: bool = False                                    # smoke/fire advice goes out once per call
+    danger: bool = False                                         # caller mentioned smoke, fire, or trouble breathing
     estimate: locator.Estimate | None = None
-    evidence_messages: int = 0    # caller messages that moved the posterior; "located" needs enough (is_located)
-    within_room_asked: int = 0   # within-room follow-ups asked after the room was found (subroom.py)
-    evidence: list[dict] = field(default_factory=list)   # how each caller message moved the room probabilities
+
+
+def _odds(p: float) -> float:
+    return p / max(1.0 - p, 1e-9)
 
 
 def normalize_phone(phone: str) -> str:
@@ -130,27 +132,12 @@ def describe_match(match: dict) -> str:
             f"({round(match['score'] * 100)}% similar). Confirm with the caller.")
 
 
-def room_denial(building: Building, denied: set[str]) -> np.ndarray | None:
-    """Per-candidate factor for room types the caller said they are not in (questions.room_types_denied), or None
-    when no room has a denied type."""
-    if not denied:
-        return None
-    room_match = np.array([bool(denied & {t.lower() for t in r["types"]}) for r in building.rooms])
-    if not room_match.any():
-        return None
-    return np.where(room_match[building.candidate_room], config.ROOM_DENIAL_FACTOR, 1.0)
-
-
 class SessionManager:
     def __init__(self, notify: Callable[[Session], Awaitable[None]]):
         self._notify = notify
         self.sessions: dict[str, Session] = {}
         self.buildings: dict[str, LoadedBuilding] = {}
         self._building_locks: dict[str, asyncio.Lock] = {}
-
-    async def notify(self, session: Session) -> None:
-        session.revision += 1
-        await self._notify(session)
 
     # ---- call lifecycle -------------------------------------------------------------------------------------
 
@@ -192,7 +179,7 @@ class SessionManager:
                 return
 
             async with session.lock:
-                if session.ended:
+                if session.ended or session.status == "out":
                     return
                 if session.requested_model:
                     actual = loaded.building.address
@@ -226,18 +213,8 @@ class SessionManager:
         lock = self._building_locks.setdefault(f"orientation:{model_id}", asyncio.Lock())
         async with lock:
             found = await asyncio.to_thread(orientation.ensure, model_id)
-            if found is not None:  # map position for the approach card's Street View link (cached, never raises)
-                await asyncio.to_thread(approach.ensure_geo, model_id)
-        if found is not None and model_id in self.buildings:
-            # The street is known now: add the "front of the house" question (adjacency.py).
-            loaded = self.buildings[model_id]
-            adjacency.register(loaded.features, loaded.building, found)
         if found is not None and session.model_id == model_id:
             await self.notify(session)
-        if config.VEXCEL_API_KEY:
-            # Warm the aerial photo cache (one Vexcel call per building) after orientation has cached the
-            # geocoordinates it needs. Background only: geo.aerial never raises and nothing waits on it.
-            asyncio.create_task(asyncio.to_thread(geo.aerial, model_id))
 
     async def _get_building(self, model_id: str) -> LoadedBuilding:
         lock = self._building_locks.setdefault(model_id, asyncio.Lock())
@@ -250,76 +227,95 @@ class SessionManager:
 
     @staticmethod
     def _load_building(model_id: str) -> LoadedBuilding:
+        """Building plus its question model. Doors and windows (layout.py, one GraphQL call the first time) feed the
+        layout questions; the street direction (orientation.py) adds "can you see the street?" when already cached
+        (it is fetched in the background on a building's first call, so that first call goes without it)."""
         building = Building.load(model_id)
-        features = followups.model_from_building(building, embeddings.embed_texts)
-        # Position questions from the floor plan; the street side only if orientation is already cached.
+        features = followups.model_from_building(building, embeddings.embed_texts, layout.ensure(model_id),
+                                                 orientation.load(model_id))
         adjacency.register(features, building, orientation.load(model_id))
         return LoadedBuilding(building, features)
 
     # ---- conversation -----------------------------------------------------------------------------------------
 
     async def handle_reply(self, session: Session, text: str, *, event_id: str | None = None) -> None:
-        text = text.strip()
-        if not text:
-            return
         async with session.lock:
-            if session.ended:
+            if session.ended or (event_id is not None and event_id in session.provider_events):
                 return
             if event_id is not None:
-                if event_id in session.provider_events:
-                    return
                 session.provider_events.add(event_id)
-            message = {"id": uuid.uuid4().hex, "role": "caller", "text": text, "ts": time.time()}
-            session.messages.append(message)
-            if session.waiting_for_match:
-                reply = questions.parse_reply(text)
-                if reply.kind == "yes":
-                    session.waiting_for_match = False
-                    if session.queued:
-                        description, session.queued = " ".join(session.queued), []
-                        await self._process(session, description)
-                    else:
-                        await self._say(session, "Describe the room you are in.")
-                elif reply.kind == "no":
-                    session.waiting_for_match = False
-                    session.queued.clear()
-                    session.status = "no_model"
-                    session.model_id = None
-                    session.status_detail = "Caller rejected the suggested building."
-                    await self._say(session, "I could not confirm the floor plan. Please start again with the complete address.")
-                else:
-                    await self._say(session, "Please say yes or no to confirm the building address.")
-                return
-            if session.status == "loading":
-                session.queued.append(text)
-            elif session.status in ("listening", "located", "best_guess"):
-                try:
-                    await self._process(session, text)
-                except Exception:
-                    log.exception("Could not process caller reply")
-                    session.messages.append({"role": "system", "text": "Could not process this reply. Please try again.", "ts": time.time()})
-            await self.notify(session)
+            try:
+                await self._handle_reply(session, text)
+            except Exception:
+                log.exception("Could not interpret caller reply")
+                session.messages.append({"role": "system", "text": "Could not process this reply. Please try again.", "ts": time.time()})
+                await self.notify(session)
 
-    async def end_call(self, session: Session, reason: str) -> None:
-        async with session.lock:
-            if session.ended:
-                return
-            session.ended = True
-            session.ready.set()
-            session.queued.clear()
-            if session.status in ("loading", "listening"):
-                session.status = "best_guess" if session.estimate is not None else "error"
-            session.status_detail = reason
+    async def _handle_reply(self, session: Session, text: str) -> None:
+        shown = text.strip()   # logged as the caller typed it; read with plain quotes (questions.normalize)
+        text = questions.normalize(text)
+        if not text:
+            return
+        session.messages.append({"id": uuid.uuid4().hex, "role": "caller", "text": shown, "ts": time.time()})
+        # "Out" and danger are checked first, even while the building is still loading: neither should wait.
+        if session.status != "out" and questions.is_out(text):
+            # The caller got out: stop asking about rooms, so they don't keep texting next to a burning building.
+            session.status = "out"
+            session.status_detail = "Caller says they are out of the building."
+            session.pending, session.queued = None, []
+            await self._say(session, questions.OUT_MESSAGE)
+            return
+        if session.status != "out" and questions.mentions_danger(text):
+            # Smoke or fire where the caller is: the dispatcher sees it on the call, and the caller gets the smoke
+            # advice now instead of after being located.
+            session.danger = True
+            if not session.safety_sent:
+                session.safety_sent = True
+                await self._say(session, questions.SAFETY_MESSAGE)
+        if session.waiting_for_match:
+            answer = questions.parse_reply(text).kind
+            if answer == "yes":
+                session.waiting_for_match = False
+                if session.queued:
+                    description, session.queued = " ".join(session.queued), []
+                    await self._process(session, description)
+                else:
+                    await self._say(session, "Tell us what room you’re in and what you can see around you.")
+            elif answer == "no":
+                session.waiting_for_match = False
+                session.queued.clear()
+                session.status, session.model_id = "no_model", None
+                session.status_detail = "Caller rejected the suggested building."
+                await self._say(session, "Please start again with the complete address.")
+            else:
+                await self._say(session, "Please say yes or no to confirm the building address.")
+            return
+        if session.status == "loading":
+            session.queued.append(text)
             await self.notify(session)
+            return
+        if session.status == "out":
+            # Not parsed for rooms, but shown up front: it is often about someone still inside.
+            session.status_detail = f"Caller is out of the building. Latest text: “{shown}”"
+        if session.status not in ("listening", "located", "best_guess"):
+            await self.notify(session)  # no_model / error / out: recorded only
+            return
+        # A located call keeps listening: "actually I'm upstairs" must still move the estimate.
+        await self._process(session, text)
 
     async def _process(self, session: Session, text: str) -> None:
         loaded = self.buildings[session.model_id]
         building = loaded.building
+        previous = (session.status, session.estimate.room if session.estimate else None)
         normalized = " ".join(text.casefold().split())
-        if session.pending is None and normalized in session.evidence_texts and not questions.is_correction(text):
-            session.messages.append({"role": "system", "text": "Repeated description. Confidence was not increased.", "ts": time.time()})
-            return
         reply = questions.parse_reply(text)
+        if questions.is_correction(text):
+            # "Sorry, I'm actually upstairs": start over from the prior instead of multiplying the correction into
+            # the earlier description. One correction after a confident wrong room (98%) otherwise only got it
+            # down to ~50%. Questions already answered stay counted toward MAX_QUESTIONS.
+            session.covered.clear()
+            session.misses.clear()
+            session.verified_room, session.unverified = None, False
         cues, semantic = None, None
         if llm.enabled():  # Claude reads paraphrase; None (failure/timeout) falls back to the local reading
             cues = await asyncio.to_thread(llm.read_message, text, session.pending, session.messages,
@@ -328,23 +324,23 @@ class SessionManager:
             semantic = await asyncio.to_thread(semantics.scores, text)
         reading = followups.read_message(text, loaded.features, session.pending, reply.kind, cues, semantic)
         before = locator.room_probabilities(session.posterior, building.candidate_room, len(building.rooms))
-        stated_floors = followups.stated_floors(text, loaded.features.floor_options)
-        explicit_numbers = re.findall(r"\b(?:(\d+)(?:st|nd|rd|th)?\s+(?:floor|level)|(?:floor|level)\s+(\d+))\b", text, re.I)
-        unsupported = any(not 1 <= int(a or b) <= len(building.floors) for a, b in explicit_numbers)
-        if unsupported:
-            session.floor_unresolved = True
-            session.messages.append({"role": "system", "text": "The caller named a floor absent from the building model. The estimate is tentative.", "ts": time.time()})
-        elif len(stated_floors) == 1:
-            session.floor_unresolved = False
-        floor_changed = len(stated_floors) == 1 and session.confirmed_floor not in (None, stated_floors[0])
-        floor_selected = len(stated_floors) == 1 and session.confirmed_floor != stated_floors[0]
-        if len(stated_floors) == 1:
-            session.confirmed_floor = stated_floors[0]
-        room_types = questions.room_types_mentioned(text) | set(cues.room_types if cues else ())
-        denied = questions.room_types_denied(text) - room_types  # "I'm not in the garage"
-        scores, boost = await asyncio.to_thread(self._evidence, loaded, text, reply, reading.explained, room_types,
-                                                reading.covered, denied)
-        topics = (reading.covered - {"floor"}) | {f"room:{room}" for room in room_types | denied}
+        pending = session.pending
+        if pending is not None and pending.key == "door_to":
+            mentions = questions.RoomMentions(set(), set(), set())  # the answer names the room outside the door
+        else:
+            mentions = questions.room_mentions(text)
+        claimed = mentions.claimed | set(cues.room_types if cues else ())
+        scores, boost = await asyncio.to_thread(self._evidence, loaded, text, reply, reading.explained, claimed,
+                                                reading.covered, mentions.denied)
+        floors = followups.stated_floors(text, loaded.features.floor_options)
+        if pending and pending.key in ("floor", "flights") and not floors:
+            parsed = followups.rule_cues(text, pending, reply.kind, floors=loaded.features.floor_options)
+            floors = tuple(int(key.removeprefix("floor")) for key in parsed.options if key.startswith("floor"))
+        floor_selected = len(floors) == 1 and session.confirmed_floor != floors[0]
+        floor_changed = floor_selected and session.confirmed_floor is not None
+        if floor_selected:
+            session.confirmed_floor = floors[0]
+        topics = (reading.covered - {"floor"}) | {f"room:{room}" for room in claimed | mentions.denied}
         key = f"{session.pending.key if session.pending else ''}:{normalized}"
         entries = session.ledger
         if floor_changed:
@@ -375,103 +371,100 @@ class SessionManager:
             session.posterior = posterior
             session.ledger = entries
             session.evidence_messages = sum(entry.scores is not None or entry.room is not None for entry in entries)
-            session.evidence_texts.add(normalized)
-        hints = self._room_hints(session, loaded, text, reply, cues, semantic, room_types)
+        self._log_evidence(session, loaded, text, before)
         session.covered |= reading.covered
-        last_kind = session.pending.kind if session.pending else None
+        if pending is not None and pending.kind in ("yesno", "choice") and pending.key not in reading.covered:
+            # No usable answer ("what?", or a description that ignores the question). Asked once more, with a hint
+            # (see _ask); after a second miss the question is dropped rather than sent a third time.
+            session.misses[pending.key] = session.misses.get(pending.key, 0) + 1
+            if session.misses[pending.key] >= 2:
+                session.covered.add(pending.key)
+        last_kind = pending.kind if pending else None
         session.pending = None
         session.estimate = self._estimate(session, loaded)
-        self._log_evidence(session, loaded, text, before)
-        located, _ = self._located(session, loaded, hints)
+        room = session.estimate.room
+        confident = session.estimate.confident and self._floor_settled(session, loaded)
 
-        if located and not session.floor_unresolved and self._floor_settled(session, loaded):
-            within = self._within_room_plan(session, loaded)
-            if within is not None:  # room found, but it is big: ask which part of it before "located"
-                session.within_room_asked += 1
-                name = building.rooms[session.estimate.room]["name"]
-                await self._ask(session, within, reading, f"Room found; narrowing down within the {name}.",
-                                use_llm=False)
+        # Corroboration: an answer to a check of this room counts only if it made the room clearly likelier (odds up
+        # VERIFY_MIN_ODDS times). "Didn't go down" wasn't enough: "Is there a closet?" answered yes "confirmed"
+        # Bedroom 3 although the runner-up, Bedroom 2, has a closet too. Otherwise another check is asked.
+        if pending is not None and pending.purpose == "verify" and pending.room == room and confident:
+            if _odds(session.estimate.room_probability) >= config.VERIFY_MIN_ODDS * _odds(pending.before):
+                session.verified_room, session.unverified = room, False
+        if confident and session.verified_room == room:
+            await self._located(session, loaded, previous, last_kind, reading.acknowledgement)
+            return
+        if confident:
+            check = None
+            if self._auto_left(session):
+                check = followups.verification(loaded.features, session.posterior, room, session.covered)
+            if check is None:
+                # Nothing in the question bank can check this room (or no questions left): report it, flagged.
+                session.verified_room, session.unverified = room, True
+                await self._located(session, loaded, previous, last_kind, reading.acknowledgement)
                 return
-            session.status = "located"
-            session.status_detail = "Caller located."
-            tied = ties.tie_group(session.posterior, building, loaded.features)
-            if tied:  # located by the confidence rule, but a look-alike room is still close: say so
-                session.status_detail = f"Caller located: {ties.describe(building, session.posterior, tied)}."
-            card = self._approach(session, loaded)
-            if card and card.get("summary"):  # dispatcher only; the caller's message below is unchanged
-                session.status_detail = f"{session.status_detail.rstrip('.')}. Approach: {card['summary']}."
-            room = building.rooms[session.estimate.room]["name"]
-            zone = self._zone(session, loaded)[1]
-            if zone:  # "Living Room, near the fireplace": the part of a big room responders should head for
-                room = f"{room}, {zone}"
-            if len(building.floors) > 1:  # "Kitchen, Floor 2": the floor matters as much as the room upstairs
-                room = f"{room}, {building.floors[int(building.room_floor[session.estimate.room])]['label']}"
-            await self._say(session, questions.LOCATED_MESSAGE.format(room=room))
+            check.purpose, check.room, check.before = "verify", room, session.estimate.room_probability
+            session.status = "listening"
+            session.status_detail = (f"Likely {self._room_label(building, room)} "
+                                     f"({round(session.estimate.room_probability * 100)}%); checking it with one "
+                                     f"more question before telling the caller.")
+            await self._ask(session, check, reading.acknowledgement, questions.VERIFY_INTRO)
             return
-        if session.floor_unresolved and not session.floor_retry_used and loaded.features.floor_options:
-            session.floor_retry_used = True
-            options = loaded.features.floor_options
-            plan = followups.Plan("choice", "floor", "Please confirm your current floor. " + followups.floor_question(options), options=options)
-            await self._ask(session, plan, reading, "Confirming the caller’s floor.", use_llm=False)
-            return
+
         plan = None
-        if len(session.asked) < config.MAX_QUESTIONS:
-            min_gain = config.MIN_INFORMATION_GAIN
+        if self._auto_left(session):
             plan = followups.choose(loaded.features, session.posterior, building.candidate_room, len(building.rooms),
-                                    session.covered | {p.key for p in session.asked}, last_kind, min_gain)
+                                    session.covered, last_kind)
         if plan is None:
-            reason = ("Question limit reached" if len(session.asked) >= config.MAX_QUESTIONS
+            reason = ("Question limit reached" if not self._auto_left(session)
                       else "No follow-up would tell the remaining rooms apart")
-            session.status = "best_guess"
             tied = ties.tie_group(session.posterior, building, loaded.features)
-            leading = (ties.describe(building, session.posterior, tied) if tied
-                       else self._leading_rooms(session, loaded))
+            leading = ties.describe(building, session.posterior, tied) if tied else self._leading_rooms(session, loaded)
             session.status_detail = f"{reason}. Most likely: {leading}."
-            if tied:  # for the dispatcher only; the caller still gets the plain best-guess text
-                session.messages.append({"role": "system", "ts": time.time(), "text": (
-                    f"Best guess: {ties.describe(building, session.posterior, tied)}. Send responders to check each.")})
+            if tied:
+                session.messages.append({"role": "system", "text": leading, "ts": time.time()})
+            if previous[0] == "best_guess":
+                await self.notify(session)  # estimate updated; the caller already got the closing text
+                return
+            session.status = "best_guess"
             await self._say(session, questions.BEST_GUESS_MESSAGE)
             return
-        await self._ask(session, plan, reading, "Waiting for the caller’s answer.")
+        session.status = "listening"  # also after a correction reopened a located call
+        session.status_detail = "Waiting for the caller’s answer."
+        await self._ask(session, plan, reading.acknowledgement)
 
-    async def _ask(self, session: Session, plan: followups.Plan, reading: followups.Reading, detail: str,
-                   use_llm: bool = True) -> None:
-        session.status = "listening"
-        session.asked.append(plan)
-        session.pending = plan
-        session.status_detail = detail
+    @staticmethod
+    def _auto_left(session: Session) -> bool:
+        return len(session.asked) < config.MAX_QUESTIONS
+
+    @staticmethod
+    def _room_label(building: Building, room: int) -> str:
+        """"Kitchen", or "Kitchen, 2nd floor" in a multi-storey building (the floor matters as much as the room).
+        Floors are named as the floor question names them ("ground floor", "3rd floor"), not by Matterport's "Floor 1"
+        labels: a caller asked "ground floor, 2nd floor, or 3rd floor?" and then told "Floor 1" can't tell which."""
+        name = building.rooms[room]["name"]
+        if len(building.floors) > 1:
+            name = f"{name}, {followups.floor_options(len(building.floors))[int(building.room_floor[room])].label}"
+        return name
+
+    async def _ask(self, session: Session, plan: followups.Plan, acknowledgement: str = "", intro: str = "",
+                   counted: bool = True) -> None:
+        """Send one planned question and wait for its answer. `counted` questions use up MAX_QUESTIONS; the
+        dispatcher's own requests don't."""
+        (session.asked if counted else session.extra_asked).append(plan)
+        repeat = plan.key == session.last_key and session.misses.get(plan.key, 0) > 0
+        session.pending, session.last_key = plan, plan.key
         question = None
-        if use_llm and llm.enabled():
-            question = await asyncio.to_thread(llm.phrase_question, plan, session.messages, reading.acknowledgement)
-        await self._say(session, question or followups.phrase(plan, reading.acknowledgement))
-
-    @staticmethod
-    def _within_room_plan(session: Session, loaded: LoadedBuilding) -> followups.Plan | None:
-        """A question about where inside the (confident) room, or None to report "located" now. getattr: the
-        within-room planner (followups.choose_within_room) may not exist yet, and then the flow is unchanged.
-        Within-room questions are phrased from the template only: llm.phrase_question knows the room-level kinds."""
-        choose_within_room = getattr(followups, "choose_within_room", None)
-        if (choose_within_room is None or session.within_room_asked >= config.MAX_WITHIN_ROOM_QUESTIONS
-                or len(session.asked) >= config.MAX_QUESTIONS):
-            return None
-        building, room = loaded.building, session.estimate.room
-        area = float(loaded.features.room_area[room])
-        if not subroom.needs_narrowing(area, subroom.region(session.posterior, building, room)):
-            return None
-        return choose_within_room(loaded.features, session.posterior, building.candidate_room, room, session.covered)
-
-    @staticmethod
-    def _zone(session: Session, loaded: LoadedBuilding) -> tuple[dict, str | None]:
-        """The estimate's region in its room, and a zone label for big rooms only: in a bathroom, "northwest
-        corner" is noise that a responder would read as precision."""
-        building, room = loaded.building, session.estimate.room
-        region = subroom.region(session.posterior, building, room)
-        area = float(loaded.features.room_area[room])
-        area = region["area_m2"] if np.isnan(area) else area
-        if area is None or area < config.BIG_ROOM_M2:
-            return region, None
-        return region, subroom.zone_label(building, room, (region["x"], region["y"]), loaded.features,
-                                          session.posterior)
+        if repeat:
+            # Same question again because its answer couldn't be read: say so, and say how to answer, instead of
+            # sending the identical text (a live caller got "Which floor are you on?" four times in a row).
+            lead = acknowledgement or questions.NOT_UNDERSTOOD
+            question = f"{lead} {plan.text} {followups.answer_hint(plan)}".strip()
+        elif llm.enabled() and plan.kind != "nearest":
+            question = await asyncio.to_thread(llm.phrase_question, plan, session.messages, acknowledgement)
+        if question is None:  # template: an intro ("To make sure:") takes the place of the acknowledgement
+            question = f"{intro} {plan.text}" if intro else followups.phrase(plan, acknowledgement)
+        await self._say(session, question)
 
     @staticmethod
     def _evidence(loaded: LoadedBuilding, text: str, reply: questions.Reply, explained: bool,
@@ -513,58 +506,104 @@ class SessionManager:
             return np.zeros(len(building.candidates)), boost
         return None, None
 
-    @staticmethod
-    def _room_hints(session: Session, loaded: LoadedBuilding, text: str, reply: questions.Reply,
-                    cues: followups.Cues | None, semantic: dict | None, room_types: set[str]) -> list[tuple[str, ...]]:
-        """What this message said about the room's kind, for locator.names_only_room: each room type the caller named,
-        plus the room-type hints of each feature they said is there ("stove" -> kitchen). Call before clearing
-        session.pending. Re-reads the keyword cues (cheap regexes) when Claude didn't supply them."""
-        if cues is None:
-            cues = followups.rule_cues(text, session.pending, reply.kind, semantic, loaded.features.floor_options)
-        keys = {key for key, said in cues.mentioned.items() if said == "yes"}
-        pending = session.pending
-        if pending is not None and pending.kind == "yesno" and cues.answer == "yes":
-            keys.add(pending.key)
-        hints = [(t.lower(),) for t in room_types]
-        hints += [followups.FEATURES_BY_KEY[k].room_types for k in keys
-                  if k in followups.FEATURES_BY_KEY and followups.FEATURES_BY_KEY[k].room_types]
-        return hints
+    async def _located(self, session: Session, loaded: LoadedBuilding, previous: tuple, last_kind: str | None,
+                       acknowledgement: str = "") -> None:
+        """The room is known (and checked, see _process). Tell the caller (once per room), then keep asking:
+          1. while the room is under CONFIRM_UNTIL, the best room question (an answer can still move the estimate,
+             and the caller is told again if the room changes);
+          2. then up to MAX_REFINEMENTS "what's closest to you?" questions while the position in the room is spread
+             out over several scan points."""
+        building = loaded.building
+        room = session.estimate.room
+        more = refine = None
+        if session.estimate.room_probability < config.CONFIRM_UNTIL and self._auto_left(session):
+            more = followups.choose(loaded.features, session.posterior, building.candidate_room, len(building.rooms),
+                                    session.covered, last_kind)
+        if more is None and len(session.refined) < config.MAX_REFINEMENTS:
+            asked = {k for plan in session.refined for k in plan.items}
+            refine = followups.refinement(loaded.features, session.posterior, room, self._xy(building), asked)
+        newly_located = previous != ("located", room)
+        session.status = "located"
+        note = " Could not be cross-checked: nothing left to ask would tell it from the others." \
+            if session.unverified else ""
+        session.status_detail = ("Caller located; asking more to be sure." if more else
+                                 "Caller located; narrowing down where in the room." if refine else
+                                 "Caller located.") + note
+        if newly_located:
+            # Separate texts, safety first: further questions are optional and come last.
+            label = self._room_label(building, room)
+            _, zone = self._zone(session, loaded)
+            if zone:
+                label = f"{label}, {zone}"
+            await self._say(session, questions.LOCATED_MESSAGE.format(room=label))
+            if not session.safety_sent:
+                session.safety_sent = True
+                await self._say(session, questions.SAFETY_MESSAGE)
+            acknowledgement = ""
+        if more is not None:
+            await self._ask(session, more, acknowledgement, questions.CONFIRM_INTRO if newly_located else "")
+        elif refine is not None:
+            session.refined.append(refine)
+            session.pending = refine
+            await self._say(session, f"{questions.REFINE_INTRO} {refine.text}" if newly_located else refine.text)
+        elif last_kind == "nearest":
+            await self._say(session, questions.REFINED_MESSAGE)
+        elif not newly_located:
+            await self.notify(session)  # same room as before: don't repeat the "located" text
+
+    # ---- questions the dispatcher asks for -------------------------------------------------------------------
+
+    async def ask_next(self, session: Session) -> str | None:
+        """The dispatcher wants another question now, even after the call is located or out of automatic
+        questions. Picks, in order: a check of an unchecked leading room, the best room question, then "what's
+        closest to you?". Returns a reason if nothing useful is left (or the call can't take questions)."""
+        if session.ended or session.status not in ("listening", "located", "best_guess") or session.posterior is None:
+            return "This call isn't taking questions."
+        loaded = self.buildings[session.model_id]
+        building, room = loaded.building, session.estimate.room
+        plan = intro = None
+        if session.verified_room != room:
+            plan = followups.verification(loaded.features, session.posterior, room, session.covered)
+            if plan is not None:
+                plan.purpose, plan.room, plan.before = "verify", room, session.estimate.room_probability
+                intro = questions.VERIFY_INTRO
+        # The dispatcher asked, so the automatic "worth a caller's text" bars don't apply: any question that still
+        # tells rooms apart will do, or else one more independent check of the leading room.
+        if plan is None:
+            plan = followups.choose(loaded.features, session.posterior, building.candidate_room, len(building.rooms),
+                                    session.covered, session.pending.kind if session.pending else None,
+                                    min_gain=config.DISPATCHER_MIN_GAIN)
+        if plan is None:
+            plan = followups.verification(loaded.features, session.posterior, room, session.covered,
+                                          min_gain=config.DISPATCHER_MIN_GAIN)
+            if plan is not None:
+                plan.purpose, plan.room, plan.before = "verify", room, session.estimate.room_probability
+                intro = questions.VERIFY_INTRO
+        if plan is None and session.status == "located":
+            asked = {k for p in session.refined for k in p.items}
+            plan = followups.refinement(loaded.features, session.posterior, room, self._xy(building), asked)
+            if plan is not None:
+                session.refined.append(plan)
+        if plan is None:
+            return "No question left that would tell the likely rooms apart. Try asking your own."
+        await self._ask(session, plan, intro=intro or "", counted=False)
+        return None
+
+    async def ask_custom(self, session: Session, text: str) -> str | None:
+        """Send the dispatcher's own question. The reply is read as free text (no planned answer to match)."""
+        text = text.strip()
+        if not text:
+            return "The question is empty."
+        if session.ended or session.status in ("out", "no_model", "error"):
+            return "This call isn't taking questions."
+        session.pending = followups.Plan("custom", "custom", text, purpose="dispatcher") \
+            if session.posterior is not None else None
+        await self._say(session, text, source="dispatcher")
+        return None
 
     @staticmethod
-    def _located(session: Session, loaded: LoadedBuilding, hints: list[tuple[str, ...]]) -> tuple[bool, bool]:
-        """(located, short only of evidence). Also rewrites estimate.confident to the full rule, so the dashboard
-        never shows "confident" while we are still asking."""
-        building = loaded.building
-        est = session.estimate
-        # Types plus the room's own label, as the feature model reads them (followups._room_kinds): a "Pantry/Laundry
-        # Room" label counts for a washer even if its only type is Pantry.
-        room_types = [{t.lower() for t in r["types"]} | ({r["label"].lower()} if r.get("label") else set())
-                      for r in building.rooms]
-        probs = locator.room_probabilities(session.posterior, building.candidate_room, len(building.rooms))
-        decisive = locator.names_only_room(room_types, est.room, hints)
-        located = locator.is_located(est, probs, room_types, session.evidence_messages, decisive)
-        short = (est.confident and not located and not locator.indistinguishable_rooms(probs, room_types, est.room))
-        session.estimate = dataclasses.replace(est, confident=located)
-        return located, short
-
-    @staticmethod
-    def _log_evidence(session: Session, loaded: LoadedBuilding, text: str, before: np.ndarray) -> None:
-        """Record what one caller message did to the room probabilities, so the dashboard can show why a room leads
-        ("-> Bathroom 1 +32%, Kitchen -20%") instead of a bare number. `ts` is the caller message's own timestamp, so
-        the dashboard can pair the entry with the message even when queued replies are processed later."""
-        building = loaded.building
-        after = locator.room_probabilities(session.posterior, building.candidate_room, len(building.rooms))
-        delta = after - before
-        order = [i for i in np.argsort(-np.abs(delta))[:3] if abs(delta[i]) >= 0.005]  # hide sub-1% noise
-        ts = next((m["ts"] for m in reversed(session.messages) if m["role"] == "caller" and m["text"] == text),
-                  time.time())
-        session.evidence.append({
-            "ts": ts, "text": text,
-            "message_id": next((m.get("id") for m in reversed(session.messages) if m["role"] == "caller" and m["ts"] == ts), None),
-            "note": "This reply did not change the leading room probabilities." if not len(order) else None, "top_before": building.rooms[int(np.argmax(before))]["name"],
-            "changes": [{"name": building.rooms[i]["name"], "delta": round(float(delta[i]), 3)} for i in order],
-        })
-        del session.evidence[:-EVIDENCE_LOG_LENGTH]
+    def _xy(building: Building) -> np.ndarray:
+        return np.array([[c["x"], c["y"]] for c in building.candidates], dtype=float)
 
     @staticmethod
     def _floor_settled(session: Session, loaded: LoadedBuilding) -> bool:
@@ -573,6 +612,10 @@ class SessionManager:
         building = loaded.building
         if len(building.floors) < 2:
             return True
+        if "floor" not in session.covered:
+            # The caller hasn't given the floor (nor said they don't know): photo matches alone once put a 3rd-floor
+            # caller in a ground-floor bedroom at 97%. followups.choose asks the floor first, so this only waits for it.
+            return False
         floors = np.bincount(building.candidate_floor, weights=session.posterior, minlength=len(building.floors))
         return floors[int(building.room_floor[session.estimate.room])] >= config.FLOOR_FIRST_UNTIL
 
@@ -585,22 +628,12 @@ class SessionManager:
         return ", ".join(f"{building.rooms[i]['name']} ({round(probs[i] * 100)}%)" for i in order)
 
     @staticmethod
-    def _approach(session: Session, loaded: LoadedBuilding) -> dict | None:
-        """Approach card (side, floor, outside wall) for the current estimate; see approach.py. Cached there."""
-        est = session.estimate
-        if est is None:
-            return None
-        window = loaded.features.p_yes.get("window")
-        return approach.for_estimate(loaded.building, est.room, est.candidate,
-                                     None if window is None else float(window[est.candidate]))
-
-    @staticmethod
     def _estimate(session: Session, loaded: LoadedBuilding) -> locator.Estimate:
         return locator.estimate(session.posterior, loaded.building.candidate_room, len(loaded.building.rooms))
 
-    async def _say(self, session: Session, text: str) -> None:
-        text = spoken_message(text)
-        session.messages.append({"role": "dispatch", "text": text, "ts": time.time()})
+    async def _say(self, session: Session, text: str, source: str = "system") -> None:
+        """Text the caller. `source` is "dispatcher" for questions the dispatcher typed (shown as such in the log)."""
+        session.messages.append({"role": "dispatch", "text": text, "ts": time.time(), "source": source})
         try:
             if session.channel != "voice":
                 await messaging.send(session.phone, text)
@@ -643,7 +676,7 @@ class SessionManager:
         data = {
             "id": session.id, "channel": session.channel, "revision": session.revision, "ended": session.ended, "phone": session.phone, "address": session.address, "created": session.created,
             "status": session.status, "status_detail": session.status_detail, "model_id": session.model_id,
-            "match": session.match,
+            "match": session.match, "danger": session.danger,
             "orientation": bool(session.model_id) and orientation.path(session.model_id).exists(),
             "messages": session.messages, "questions_asked": len(session.asked),
             "max_questions": config.MAX_QUESTIONS, "rooms": [], "floors": [], "candidate_probabilities": [],
@@ -687,6 +720,7 @@ class SessionManager:
                 "x": candidate["x"], "y": candidate["y"], "room_probability": est.room_probability,
                 "runner_up_probability": est.runner_up_probability, "confident": est.confident,
                 "evidence_messages": session.evidence_messages,
+                "checked": session.verified_room == est.room and not session.unverified,
             }
             # Where inside the room (subroom.py): a circle for the dashboard, and words like "near the stove".
             region, zone = self._zone(session, loaded)
@@ -694,3 +728,79 @@ class SessionManager:
             data["estimate"]["zone_label"] = zone
             data["approach"] = self._approach(session, loaded)  # which side, floor and outside wall (approach.py)
         return data
+
+
+    async def end_call(self, session: Session, reason: str) -> None:
+        async with session.lock:
+            if session.ended:
+                return
+            session.ended = True
+            session.ready.set()
+            session.queued.clear()
+            if session.status in ("loading", "listening"):
+                session.status = "best_guess" if session.estimate is not None else "error"
+            session.status_detail = reason
+            await self.notify(session)
+
+
+    @staticmethod
+    def _log_evidence(session: Session, loaded: LoadedBuilding, text: str, before: np.ndarray) -> None:
+        """Record what one caller message did to the room probabilities, so the dashboard can show why a room leads
+        ("-> Bathroom 1 +32%, Kitchen -20%") instead of a bare number. `ts` is the caller message's own timestamp, so
+        the dashboard can pair the entry with the message even when queued replies are processed later."""
+        building = loaded.building
+        after = locator.room_probabilities(session.posterior, building.candidate_room, len(building.rooms))
+        delta = after - before
+        order = [i for i in np.argsort(-np.abs(delta))[:3] if abs(delta[i]) >= 0.005]  # hide sub-1% noise
+        ts = next((m["ts"] for m in reversed(session.messages) if m["role"] == "caller" and m["text"] == text),
+                  time.time())
+        session.evidence.append({
+            "ts": ts, "text": text,
+            "message_id": next((m.get("id") for m in reversed(session.messages) if m["role"] == "caller" and m["ts"] == ts), None),
+            "note": "This reply did not change the leading room probabilities." if not len(order) else None, "top_before": building.rooms[int(np.argmax(before))]["name"],
+            "changes": [{"name": building.rooms[i]["name"], "delta": round(float(delta[i]), 3)} for i in order],
+        })
+        del session.evidence[:-EVIDENCE_LOG_LENGTH]
+
+
+    @staticmethod
+    def _zone(session: Session, loaded: LoadedBuilding) -> tuple[dict, str | None]:
+        """The estimate's region in its room, and a zone label for big rooms only: in a bathroom, "northwest
+        corner" is noise that a responder would read as precision."""
+        building, room = loaded.building, session.estimate.room
+        region = subroom.region(session.posterior, building, room)
+        area = float(loaded.features.room_area[room])
+        area = region["area_m2"] if np.isnan(area) else area
+        if area is None or area < config.BIG_ROOM_M2:
+            return region, None
+        return region, subroom.zone_label(building, room, (region["x"], region["y"]), loaded.features,
+                                          session.posterior)
+
+
+    @staticmethod
+    def _approach(session: Session, loaded: LoadedBuilding) -> dict | None:
+        """Approach card (side, floor, outside wall) for the current estimate; see approach.py. Cached there."""
+        est = session.estimate
+        if est is None:
+            return None
+        window = loaded.features.p_yes.get("window")
+        return approach.for_estimate(loaded.building, est.room, est.candidate,
+                                     None if window is None else float(window[est.candidate]))
+
+
+    async def notify(self, session: Session) -> None:
+        session.revision += 1
+        await self._notify(session)
+
+EVIDENCE_LOG_LENGTH = 20
+
+
+def room_denial(building: Building, denied: set[str]) -> np.ndarray | None:
+    """Per-candidate factor for room types the caller said they are not in (questions.room_types_denied), or None
+    when no room has a denied type."""
+    if not denied:
+        return None
+    room_match = np.array([bool(denied & {t.lower() for t in r["types"]}) for r in building.rooms])
+    if not room_match.any():
+        return None
+    return np.where(room_match[building.candidate_room], config.ROOM_DENIAL_FACTOR, 1.0)

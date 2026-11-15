@@ -47,21 +47,6 @@ def latest_reply(history: str) -> tuple[int, str]:
     return len(users), users[-1]
 
 
-def spoken_message(text: str) -> str:
-    """Keep the MVP's question wording without claiming a demo dispatched real responders."""
-    return (text.replace(
-        "This is 911 emergency services. We're working to find you inside the building.",
-        "This is the HackPrinceton caller-location demo.")
-        .replace("Responders now know which room you're in", "The demo estimates you're in this room")
-        .replace("Stay where you are; help is on the way.", "You can correct this estimate if needed.")
-        .replace("Responders have your approximate location.", "The demo has an approximate location estimate.")
-        .replace("Stay where you are and keep your phone with you.", "You can correct this estimate if needed.")
-        .replace("Thank you. Stay where you are if it is safe; responders are on the way to your address.",
-                 "The demo could not find an interior model for this address.")
-        .replace("Thank you, that helps responders find you. Stay where you are.",
-                 "Thank you, that refines the demo's location estimate."))
-
-
 class VoiceBridge:
     def __init__(self, manager: "SessionManager", wait_seconds: float = 10):
         self.manager = manager
@@ -93,7 +78,7 @@ class VoiceBridge:
                 raise VoiceError("This conversation already has a different building address.", 409)
         # A retry returns the opening again but never starts another session.
         return {"session_id": call.session.id, "status": call.session.status, "pending": False,
-                "say": spoken_message(call.session.messages[0]["text"]),
+                "say": call.session.messages[0]["text"],
                 "response_id": 0, "instruction": "Ask this question. If the caller already described the room, submit that answer now."}
 
     async def reply(self, conversation_id: str, history: str, acknowledge: int | None = None) -> dict:
@@ -155,14 +140,14 @@ class VoiceBridge:
             return {"session_id": session.id, "status": "loading", "pending": True,
                     "say": "I'm still loading the building's interior.",
                     "instruction": "Call location_status again. Do not resubmit the caller's answer."}
-        messages = [spoken_message(m["text"]) for m in session.messages[call.delivered:]
+        messages = [m["text"] for m in session.messages[call.delivered:]
                     if m["role"] == "dispatch"]
         call.offered = len(session.messages)
         if acknowledge is None:
             call.delivered = call.offered
         if session.status == "error":
-            messages = ["The demo could not process the building. Please check the dispatcher dashboard."]
+            messages = ["The floor plan could not be loaded."]
         return {"session_id": session.id, "status": session.status, "pending": False,
-                "say": " ".join(messages) or "Thank you. The demo has recorded your answer.",
+                "say": " ".join(messages) or "Thank you. Your answer has been recorded.",
                 "awaiting_answer": session.pending is not None, "response_id": call.offered,
                 "instruction": "Say the returned text exactly. Accept corrections; do not invent another question."}

@@ -118,7 +118,7 @@ def _import_sessions():
     return sessions
 
 
-NEAR = followups.Plan("near", "near", "Which are you closest to: the stove, the couch, or the sliding door?")
+NEAR = followups.Plan("nearest", "nearest", "Which are you closest to: the stove, the couch, or the sliding door?")
 
 
 def _call(monkeypatch, posterior, stove_east=False, within=True):
@@ -131,9 +131,9 @@ def _call(monkeypatch, posterior, stove_east=False, within=True):
                         lambda *a, **k: followups.Reading(None, set(), "", True))
     monkeypatch.setattr(sessions.SessionManager, "_evidence", staticmethod(lambda *a, **k: (None, None)))
     if within:
-        monkeypatch.setattr(sessions.followups, "choose_within_room", lambda *a: NEAR, raising=False)
+        monkeypatch.setattr(sessions.followups, "refinement", lambda *a: NEAR, raising=False)
     else:
-        monkeypatch.delattr(sessions.followups, "choose_within_room", raising=False)
+        monkeypatch.setattr(sessions.followups, "refinement", lambda *a: None)
 
     async def notify(session):
         pass
@@ -146,20 +146,21 @@ def _call(monkeypatch, posterior, stove_east=False, within=True):
     # The posterior above stands for earlier caller messages: count one, so the located rule's evidence minimum
     # (locator.is_located, MIN_EVIDENCE_MESSAGES) is met by the message each test sends.
     session.evidence_messages = 1
+    session.verified_room = int(np.argmax(locator.room_probabilities(posterior, building.candidate_room, len(building.rooms))))
     return manager, session
 
 
-def test_big_room_asks_within_room_questions_before_located(monkeypatch):
+def test_verified_big_room_asks_within_room_questions(monkeypatch):
     uniform_in_room = posterior_on({c: 1.0 for c in range(6)})
     manager, session = _call(monkeypatch, uniform_in_room)
     asyncio.run(manager._process(session, "I'm in the living room"))
-    assert session.status == "listening" and session.pending is NEAR
-    assert session.status_detail == "Room found; narrowing down within the Dining Room / Kitchen / Living Room."
+    assert session.status == "located" and session.pending is NEAR
+    assert "narrowing down" in session.status_detail
     asyncio.run(manager._process(session, "the couch"))
-    assert session.within_room_asked == config.MAX_WITHIN_ROOM_QUESTIONS == 2
+    assert len(session.refined) == config.MAX_REFINEMENTS == 2
     asyncio.run(manager._process(session, "still the couch"))
-    assert session.status == "located" and len(session.asked) == 2
-    assert "(Dining Room / Kitchen / Living Room)" in session.messages[-1]["text"]
+    assert session.status == "located" and len(session.refined) == 2
+    assert any("Responders will look for you in the Dining Room / Kitchen / Living Room" in m["text"] for m in session.messages)
 
     snap = manager.snapshot(session)["estimate"]
     assert set(snap["region"]) == {"x", "y", "radius_m", "sweeps"} and len(snap["region"]["sweeps"]) == 6
@@ -176,5 +177,5 @@ def test_located_message_names_the_zone(monkeypatch):
     manager, session = _call(monkeypatch, posterior_on({2: 0.5, 5: 0.5}), stove_east=True)
     asyncio.run(manager._process(session, "I'm in the kitchen by the stove"))
     assert session.status == "located" and not session.asked   # region already narrow: nothing to ask
-    assert "(Dining Room / Kitchen / Living Room, kitchen end, near the stove)" in session.messages[-1]["text"]
+    assert any("Responders will look for you in the Dining Room / Kitchen / Living Room, kitchen end, near the stove" in m["text"] for m in session.messages)
     assert manager.snapshot(session)["estimate"]["zone_label"] == "kitchen end, near the stove"

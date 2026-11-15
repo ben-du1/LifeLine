@@ -1,6 +1,6 @@
 import React, { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import { getBuilding, getConfig, getRoomShots, getSessions, sendReply, startCall, subscribe } from "./api.js";
-import { getAddresses, getDemoBuildings } from "./api.js";
+import { getAddresses } from "./api.js";
 import FloorPlan from "./FloorPlan.jsx";
 import ApproachCard from "./ApproachCard.jsx";
 import { checkOrder, confidenceWord, describeEffect, pct } from "./confidence.js";
@@ -15,6 +15,7 @@ const STATUS_LABELS = {
   listening: "Locating",
   located: "Located",
   best_guess: "Best guess",
+  out: "Outside",
   no_model: "No interior model",
   error: "Error",
 };
@@ -119,12 +120,6 @@ export default function App() {
             </li>
           ))}
         </ul>
-        {config && (
-          <p className="side-foot">
-            {config.messaging_mode === "photon" ? "Texts go out over iMessage (Photon)." : "Simulated caller: type replies in the call."}{" "}
-            {config.followups === "claude" ? "Claude reads replies." : "Replies are read by keyword rules."}
-          </p>
-        )}
       </aside>
 
       <main className="main">
@@ -133,7 +128,7 @@ export default function App() {
             <SessionView session={selected} building={buildings[selected.model_id]} config={config} />
           </SessionBoundary>
         ) : (
-          <div className="empty">Start a simulated 911 call to begin.</div>
+          <div className="empty">No active call</div>
         )}
       </main>
     </div>
@@ -144,16 +139,10 @@ function CallForm({ defaultPhone, onSubmit }) {
   const [phone, setPhone] = useState("");
   const [address, setAddress] = useState(DEMO_ADDRESS);
   const [busy, setBusy] = useState(false);
-  // Demo buildings with their cache state (GET /api/demo, ready first). Empty if the backend has no list.
-  const [demos, setDemos] = useState([]);
-  useEffect(() => {
-    if (!phone && defaultPhone) setPhone(defaultPhone);
-  }, [defaultPhone]);
-  useEffect(() => {
-    getDemoBuildings().then(setDemos).catch(() => setDemos([]));
-  }, []);
   const sameAddress = (a, b) => a.trim().toLowerCase() === b.trim().toLowerCase();
-  const chosenDemo = demos.find((d) => sameAddress(d.address, address));
+  useEffect(() => {
+    if (defaultPhone) setPhone((value) => value || defaultPhone);
+  }, [defaultPhone]);
   // Suggestions from all ~10,000 callable addresses in the hackathon's model index (GET /api/addresses).
   const [suggestions, setSuggestions] = useState([]);
   useEffect(() => {
@@ -183,28 +172,15 @@ function CallForm({ defaultPhone, onSubmit }) {
       onSubmit={async (e) => {
         e.preventDefault();
         setBusy(true);
-        await onSubmit(phone, address, picked?.model_id || chosenDemo?.model_id || null);
+        await onSubmit(phone, address, picked?.model_id || null);
         setBusy(false);
       }}
     >
-      <h2 className="side-title">New 911 call</h2>
+      <h2 className="side-title">New call</h2>
       <label>
         Caller phone
         <input value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="+1 609 555 0100" required />
       </label>
-      {demos.length > 0 && (
-        <label>
-          Demo buildings
-          <select value={chosenDemo?.address || ""} onChange={(e) => e.target.value && setAddress(e.target.value)}>
-            <option value="">Any address (type below)</option>
-            {demos.map((d) => (
-              <option key={d.address} value={d.address} title={[d.note, ...(d.problems || [])].join("\n")}>
-                {d.ready ? "✓" : "⚠"} {d.label}
-              </option>
-            ))}
-          </select>
-        </label>
-      )}
       <label>
         Address
         <input
@@ -227,9 +203,6 @@ function CallForm({ defaultPhone, onSubmit }) {
         <Suspense fallback={<div className="address-map" />}>
           <AddressMap suggestions={suggestions} picked={picked} onPick={(s) => setAddress(s.address)} />
         </Suspense>
-      )}
-      {((chosenDemo && !chosenDemo.cached) || (picked && !picked.cached)) && (
-        <p className="demo-warning">First call to this building downloads it, which takes a few minutes.</p>
       )}
       <button type="submit" className="primary" disabled={busy}>
         {busy ? "Starting…" : "Start call"}
@@ -284,16 +257,13 @@ function SessionView({ session, building, config }) {
               {session.status === "listening" ? "No estimate yet" : session.status_detail}
             </p>
           )}
+          {session.danger && <p className="match match-approx">Caller reported danger</p>}
           {estimate?.zone_label && <p className="incident-zone">{capitalize(estimate.zone_label)}</p>}
-          {!estimate && session.status === "listening" && (
-            <p className="incident-zone">Waiting for the caller to describe the room.</p>
-          )}
         </div>
         <div className="incident-numbers">
           {estimate && (
             <p className="incident-odds">
               <span className="incident-pct">{pct(estimate.room_probability)}</span>
-              <ConfidenceTag status={session.status} probability={estimate.room_probability} />
               <span className="muted">next best {pct(estimate.runner_up_probability)}</span>
             </p>
           )}
@@ -311,6 +281,8 @@ function SessionView({ session, building, config }) {
             <h2>{building ? building.address : session.address}</h2>
             <MatchNote session={session} />
           </div>
+        </div>
+        <div className="plan-controls">
           <div className="panel-tools">
             {floorplan && planMode === "plan" && (
               <label className="toggle">
@@ -320,25 +292,25 @@ function SessionView({ session, building, config }) {
             )}
             {building && (
               <div className="segmented" role="group" aria-label="Plan view">
-                <button type="button" className={planMode === "plan" ? "active" : ""} onClick={() => setPlanMode("plan")}>
+                <button type="button" aria-pressed={planMode === "plan"} className={planMode === "plan" ? "active" : ""} onClick={() => setPlanMode("plan")}>
                   Plan
                 </button>
-                <button type="button" className={planMode === "map" ? "active" : ""} onClick={() => setPlanMode("map")}>
+                <button type="button" aria-pressed={planMode === "map"} className={planMode === "map" ? "active" : ""} onClick={() => setPlanMode("map")}>
                   Map
                 </button>
               </div>
             )}
           </div>
+          {building && multiFloor && (
+            <FloorTabs
+              floors={session.floors.length ? session.floors : building.floors}
+              shown={shownFloor}
+              estimateFloor={estimate?.floor}
+              followsEstimate={pickedFloor === null}
+              onPick={setPickedFloor}
+            />
+          )}
         </div>
-        {building && multiFloor && (
-          <FloorTabs
-            floors={session.floors.length ? session.floors : building.floors}
-            shown={shownFloor}
-            estimateFloor={estimate?.floor}
-            followsEstimate={pickedFloor === null}
-            onPick={setPickedFloor}
-          />
-        )}
         {building && planMode === "map" ? (
           <Suspense fallback={<div className="plan-placeholder">Loading map…</div>}>
             <MapView
@@ -377,20 +349,17 @@ function SessionView({ session, building, config }) {
       </section>
 
       <section className="panel conversation-panel">
-        <h2>Text thread with {session.phone}</h2>
+        <h2>Conversation</h2>
         <Conversation messages={session.messages} evidence={session.evidence} />
         <CallerBox session={session} mode={config?.messaging_mode} />
       </section>
 
       <section className="panel rooms-panel">
-        <h2>Where the caller could be</h2>
+        <h2>Room probabilities</h2>
         {session.rooms.length === 0 ? (
           <p className="muted">Waiting for the building to load.</p>
         ) : !estimate && session.status === "listening" ? (
-          <p className="muted">
-            All {session.rooms.length} rooms are equally likely until the caller describes the room. The list fills in
-            after their first useful reply.
-          </p>
+          <p className="muted">No room evidence yet.</p>
         ) : (
           <RoomBars session={session} shownRoom={shownRoom} multiFloor={multiFloor} onPick={pickRoom} />
         )}
@@ -558,7 +527,7 @@ function FloorTabs({ floors, shown, estimateFloor, followsEstimate, onPick }) {
 function MatchNote({ session }) {
   const match = session.match;
   if (!match) return null;
-  if (match.exact) return <p className="match match-exact">Exact address match</p>;
+  if (match.exact) return null;
   return (
     <p className="match match-approx" title={`Caller address: ${session.address}`}>
       Closest match to “{session.address}” ({pct(match.score)} similar). Confirm the address with the caller.
@@ -586,7 +555,7 @@ function Conversation({ messages, evidence = [] }) {
         const entry = m.role === "caller" ? effectFor(m) : null;
         return (
           <li key={i} className={`msg msg-${m.role}`}>
-            <span className="visually-hidden">{m.role === "dispatch" ? "Sent to caller:" : m.role === "caller" ? "Caller:" : "Note:"}</span>
+            <span className="msg-who">{m.role === "dispatch" ? "To caller" : m.role === "caller" ? "Caller" : "Operator note"}</span>
             <span className="msg-text">{m.text}</span>
             {entry && (
               <span className="msg-effect" title={`Top room before this message: ${entry.top_before}`}>

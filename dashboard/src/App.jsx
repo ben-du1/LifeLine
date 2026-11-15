@@ -60,16 +60,14 @@ export default function App() {
   return (
     <div className="app">
       <header className="topbar">
-        <h1>Caller Locator</h1>
+        <h1 className="brand">
+          <span className="brand-mark" aria-hidden="true"><span /></span>
+          LifeLine
+        </h1>
         <div className="topbar-meta">
           {config && (
-            <span className="badge" title="How messages reach the caller">
-              {config.messaging_mode === "photon" ? "iMessage via Photon" : "Simulated caller"}
-            </span>
-          )}
-          {config && (
-            <span className="badge" title="Who reads replies and words follow-up questions">
-              {config.followups === "claude" ? "Follow-ups: Claude" : "Follow-ups: keyword rules"}
+            <span className="channel" title="How messages reach the caller">
+              {config.messaging_mode === "photon" ? "iMessage" : "Simulation"}
             </span>
           )}
           <span className={`conn ${connected ? "on" : "off"}`}>{connected ? "Live" : "Reconnecting…"}</span>
@@ -79,15 +77,16 @@ export default function App() {
       <aside className="sidebar">
         <CallForm defaultPhone={config?.dev_test_phone || ""} onSubmit={handleCall} />
         {error && <p className="error">{error}</p>}
-        <h2>Calls</h2>
+        <h2 className="calls-heading">Calls</h2>
         <ul className="session-list">
           {ordered.length === 0 && <li className="muted">No calls yet.</li>}
           {ordered.map((s) => (
             <li key={s.id}>
-              <button className={s.id === selected?.id ? "session active" : "session"} onClick={() => setSelectedId(s.id)}>
+              <button className={s.id === selected?.id ? "session active" : "session"} aria-pressed={s.id === selected?.id} onClick={() => setSelectedId(s.id)}>
                 <span className="session-address">{s.address}</span>
                 <span className="session-meta">
-                  {s.phone} · <StatusPill status={s.status} />
+                  <span>{s.phone}</span>
+                  <StatusPill status={s.status} />
                 </span>
               </button>
             </li>
@@ -99,7 +98,13 @@ export default function App() {
         {selected ? (
           <SessionView session={selected} building={buildings[selected.model_id]} config={config} />
         ) : (
-          <div className="empty">Start a simulated 911 call to begin.</div>
+          <section className="empty">
+            <div className="empty-copy">
+              <h2>No active call</h2>
+              <p>Start a call to load its floor plan.</p>
+            </div>
+            <div className="empty-grid" aria-hidden="true"><span className="map-crosshair" /></div>
+          </section>
         )}
       </main>
     </div>
@@ -124,10 +129,10 @@ function CallForm({ defaultPhone, onSubmit }) {
         setBusy(false);
       }}
     >
-      <h2>Incoming 911 call</h2>
+      <h2>New call</h2>
       <label>
         Caller phone
-        <input value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="+1 609 555 0100" required />
+        <input type="tel" value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="+1 609 555 0100" required />
       </label>
       <label>
         Address
@@ -173,18 +178,6 @@ function SessionView({ session, building, config }) {
           <StatusPill status={session.status} />
           <span className="status-detail">{session.status_detail}</span>
         </div>
-        <div className="status-numbers">
-          <span>
-            Questions {session.questions_asked}/{session.max_questions}
-          </span>
-          {estimate && (
-            <span>
-              Top room <strong>{estimate.room_name}</strong>
-              {multiFloor ? ` (${estimate.floor_label})` : ""} {pct(estimate.room_probability)} (next{" "}
-              {pct(estimate.runner_up_probability)}) · spot ±{estimate.radius_m?.toFixed(1)} m
-            </span>
-          )}
-        </div>
       </section>
 
       <section className="panel plan-panel">
@@ -220,9 +213,10 @@ function SessionView({ session, building, config }) {
           />
         ) : (
           <div className="plan-placeholder">
-            {session.status === "no_model" || session.status === "error"
-              ? session.status_detail
-              : "Loading interior model…"}
+            <span className="map-crosshair" aria-hidden="true" />
+            <span>{session.status === "no_model" || session.status === "error"
+              ? "Floor plan unavailable"
+              : "Loading floor plan…"}</span>
           </div>
         )}
         {building && (
@@ -243,8 +237,24 @@ function SessionView({ session, building, config }) {
 
       <section className="panel rooms-panel">
         <h2>Room probabilities</h2>
+        {estimate && (
+          <div className="estimate-summary">
+            <div>
+              <span className="estimate-label">Top estimate</span>
+              <strong>{estimate.room_name}</strong>
+              {multiFloor && <span>{estimate.floor_label}</span>}
+            </div>
+            <div className="estimate-values">
+              <strong>{pct(estimate.room_probability)}</strong>
+              <span>
+                Next {pct(estimate.runner_up_probability)}
+                {Number.isFinite(estimate.radius_m) && ` · ±${estimate.radius_m.toFixed(1)} m`}
+              </span>
+            </div>
+          </div>
+        )}
         {session.rooms.length === 0 ? (
-          <p className="muted">Waiting for the building to load.</p>
+          <p className="muted">No estimates yet.</p>
         ) : (
           <ul className="room-bars">
             {session.rooms.map((room) => (
@@ -370,17 +380,18 @@ function MatchNote({ session }) {
 }
 
 function Conversation({ messages }) {
-  const end = useRef(null);
-  useEffect(() => end.current?.scrollIntoView({ block: "end" }), [messages.length]);
+  const list = useRef(null);
+  useEffect(() => {
+    if (list.current) list.current.scrollTop = list.current.scrollHeight;
+  }, [messages]);
   return (
-    <ol className="messages">
+    <ol className="messages" ref={list}>
       {messages.map((m, i) => (
         <li key={i} className={`msg msg-${m.role}`}>
           <span className="msg-who">{m.role === "dispatch" ? "To caller" : m.role === "caller" ? "Caller" : "System"}</span>
           <span className="msg-text">{m.text}</span>
         </li>
       ))}
-      <li ref={end} />
     </ol>
   );
 }
@@ -411,7 +422,7 @@ function CallerBox({ session, mode }) {
       }}
     >
       <label htmlFor="caller-input">
-        Simulated caller reply{mode === "photon" ? " (overrides iMessage for testing)" : ""}
+        {mode === "photon" ? "Test reply" : "Simulated reply"}
       </label>
       <div className="caller-row">
         <input

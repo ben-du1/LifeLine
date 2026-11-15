@@ -3,7 +3,7 @@ import { createServer } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 import { pathToFileURL } from "node:url";
 
-const paths = new Set(["/api/voice/start", "/api/voice/reply", "/api/voice/status"]);
+const paths = new Set(["/api/voice/start", "/api/voice/reply", "/api/voice/status", "/api/voice/post-call"]);
 
 export function createGateway({ token, backendUrl = "http://127.0.0.1:8000", fetchImpl = fetch }) {
   if (!token) throw new Error("VOICE_TOOL_TOKEN is required. Run npm run setup first.");
@@ -15,7 +15,8 @@ export function createGateway({ token, backendUrl = "http://127.0.0.1:8000", fet
     };
     if (req.method !== "POST" || !paths.has(req.url)) return respond(404, { error: "Not found" });
     const supplied = Buffer.from(req.headers.authorization || "");
-    if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) {
+    const postCall = req.url === "/api/voice/post-call";
+    if (!postCall && (supplied.length !== expected.length || !timingSafeEqual(supplied, expected))) {
       return respond(401, { error: "Unauthorized" });
     }
     let size = 0;
@@ -30,7 +31,11 @@ export function createGateway({ token, backendUrl = "http://127.0.0.1:8000", fet
       try { JSON.parse(body); } catch { return respond(400, { error: "Invalid JSON" }); }
       const response = await fetchImpl(new URL(req.url, backendUrl), {
         method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+        headers: {
+          "Content-Type": "application/json",
+          ...(postCall ? { "ElevenLabs-Signature": req.headers["elevenlabs-signature"] || "" }
+            : { Authorization: "Bearer " + token }),
+        },
         body,
         signal: AbortSignal.timeout(115000),
         redirect: "error",

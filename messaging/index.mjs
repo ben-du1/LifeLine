@@ -101,13 +101,13 @@ async function send(to, text) {
   });
 }
 
-async function forward(from, text) {
+async function forward(from, text, eventId) {
   const response = await fetch(`${BACKEND_URL}/api/inbound`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ from, text }),
+    body: JSON.stringify({ from, text, event_id: eventId }),
   });
-  if (!response.ok) console.warn(`backend rejected reply from ${from}: ${response.status}`);
+  if (!response.ok && response.status !== 404) throw new Error(`Backend rejected reply: ${response.status}`);
 }
 
 // Forward new caller texts to the backend, which matches them to a call by phone number.
@@ -119,11 +119,12 @@ async function pollForever(startedAt) {
       const since = new Date(Math.max(startedAt.getTime(), cursor.getTime() - POLL_OVERLAP_MS));
       for (const message of await receivedSince(since)) {
         if (seen.has(message.id)) continue;
+        const from = remember(message);
+        if (from && message.content?.type === "text") {
+          await forward(from, message.content.text, message.id);
+        }
         seen.add(message.id);
         cursor = new Date(Math.max(cursor.getTime(), Date.parse(message.createdAt)));
-        const from = remember(message);
-        if (!from || message.content?.type !== "text") continue;
-        await forward(from, message.content.text);
       }
     } catch (err) {
       console.error("polling Photon failed:", err.message || err);

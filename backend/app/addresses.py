@@ -205,6 +205,16 @@ def similarity(query_text: str, candidate_text: str) -> float:
     return max(0.0, min(1.0, score))
 
 
+def with_locality(name: str, address: str) -> str:
+    """A model's name followed by the city/state/ZIP parts of its address field (everything after the street), so
+    a name like "2810 Princeton St" is still compared as being in Houston. Returns the name as is when the address
+    field has nothing after the street."""
+    if not name:
+        return ""
+    locality = address.split(",", 1)[1].strip() if "," in address else ""
+    return f"{name}, {locality}" if locality else name
+
+
 def is_exact(query_text: str, candidate_text: str) -> bool:
     """Same house number and street words (suffix and city formatting aside)."""
     query, candidate = parse_freeform(query_text), parse_matterport(candidate_text)

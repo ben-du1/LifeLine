@@ -1,6 +1,13 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import { getBuilding, getConfig, getRoomShots, getSessions, sendReply, startCall, subscribe } from "./api.js";
+import { getAddresses } from "./api.js";
 import FloorPlan from "./FloorPlan.jsx";
+import ApproachCard from "./ApproachCard.jsx";
+import { checkOrder, confidenceWord, describeEffect, pct } from "./confidence.js";
+
+// Leaflet is only needed once the dispatcher opens the map, so it is loaded then.
+const MapView = lazy(() => import("./MapView.jsx"));
+const AddressMap = lazy(() => import("./AddressMap.jsx"));
 
 const DEMO_ADDRESS = "13122 Chipman Glen Dr, Houston, TX";
 const STATUS_LABELS = {
@@ -8,9 +15,36 @@ const STATUS_LABELS = {
   listening: "Locating",
   located: "Located",
   best_guess: "Best guess",
+  out: "Outside",
   no_model: "No interior model",
   error: "Error",
 };
+
+function mergeSession(sessions, incoming) {
+  const current = sessions[incoming.id];
+  if (current && (current.revision ?? 0) > (incoming.revision ?? 0)) return sessions;
+  return { ...sessions, [incoming.id]: incoming };
+}
+
+class SessionBoundary extends React.Component {
+  state = { failed: false };
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  render() {
+    if (this.state.failed) {
+      return (
+        <section className="panel" role="alert">
+          <p>Unable to display this call.</p>
+          <button onClick={() => this.setState({ failed: false })}>Retry call view</button>
+        </section>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 export default function App() {
   const [config, setConfig] = useState(null);
@@ -23,11 +57,12 @@ export default function App() {
   useEffect(() => {
     getConfig().then(setConfig).catch((e) => setError(e.message));
     getSessions()
-      .then((list) => setSessions(Object.fromEntries(list.map((s) => [s.id, s]))))
+      .then((list) => setSessions((prev) => list.reduce(mergeSession, prev)))
       .catch(() => {});
     return subscribe(
-      (session) => setSessions((prev) => ({ ...prev, [session.id]: session })),
+      (session) => setSessions((prev) => mergeSession(prev, session)),
       setConnected,
+      () => { setSessions({}); setSelectedId(null); setBuildings({}); },
     );
   }, []);
 
@@ -46,11 +81,11 @@ export default function App() {
       .catch((e) => setError(e.message));
   }, [selected?.model_id, selected?.status, selected?.orientation, buildings]);
 
-  async function handleCall(phone, address) {
+  async function handleCall(phone, address, modelId) {
     setError("");
     try {
-      const session = await startCall(phone, address);
-      setSessions((prev) => ({ ...prev, [session.id]: session }));
+      const session = await startCall(phone, address, modelId);
+      setSessions((prev) => mergeSession(prev, session));
       setSelectedId(session.id);
     } catch (e) {
       setError(e.message);
@@ -60,26 +95,17 @@ export default function App() {
   return (
     <div className="app">
       <header className="topbar">
-        <h1>Caller Locator</h1>
-        <div className="topbar-meta">
-          {config && (
-            <span className="badge" title="How messages reach the caller">
-              {config.messaging_mode === "photon" ? "iMessage via Photon" : "Simulated caller"}
-            </span>
-          )}
-          {config && (
-            <span className="badge" title="Who reads replies and words follow-up questions">
-              {config.followups === "claude" ? "Follow-ups: Claude" : "Follow-ups: keyword rules"}
-            </span>
-          )}
-          <span className={`conn ${connected ? "on" : "off"}`}>{connected ? "Live" : "Reconnecting…"}</span>
-        </div>
+        <h1 className="brand">
+          <span className="brand-mark" aria-hidden="true"><span /></span>
+          LifeLine
+        </h1>
+        <span className={`conn ${connected ? "on" : "off"}`}>{connected ? "Live" : "Reconnecting"}</span>
       </header>
 
       <aside className="sidebar">
         <CallForm defaultPhone={config?.dev_test_phone || ""} onSubmit={handleCall} />
         {error && <p className="error">{error}</p>}
-        <h2>Calls</h2>
+        <h2 className="side-title">Calls</h2>
         <ul className="session-list">
           {ordered.length === 0 && <li className="muted">No calls yet.</li>}
           {ordered.map((s) => (
@@ -87,7 +113,8 @@ export default function App() {
               <button className={s.id === selected?.id ? "session active" : "session"} onClick={() => setSelectedId(s.id)}>
                 <span className="session-address">{s.address}</span>
                 <span className="session-meta">
-                  {s.phone} · <StatusPill status={s.status} />
+                  <span>{s.phone}</span>
+                  <StatusPill status={s.status} />
                 </span>
               </button>
             </li>
@@ -97,9 +124,11 @@ export default function App() {
 
       <main className="main">
         {selected ? (
-          <SessionView session={selected} building={buildings[selected.model_id]} config={config} />
+          <SessionBoundary key={selected.id}>
+            <SessionView session={selected} building={buildings[selected.model_id]} config={config} />
+          </SessionBoundary>
         ) : (
-          <div className="empty">Start a simulated 911 call to begin.</div>
+          <div className="empty">No active call</div>
         )}
       </main>
     </div>
@@ -110,9 +139,32 @@ function CallForm({ defaultPhone, onSubmit }) {
   const [phone, setPhone] = useState("");
   const [address, setAddress] = useState(DEMO_ADDRESS);
   const [busy, setBusy] = useState(false);
+  const sameAddress = (a, b) => a.trim().toLowerCase() === b.trim().toLowerCase();
   useEffect(() => {
-    if (!phone && defaultPhone) setPhone(defaultPhone);
+    if (defaultPhone) setPhone((value) => value || defaultPhone);
   }, [defaultPhone]);
+  // Suggestions from all ~10,000 callable addresses in the hackathon's model index (GET /api/addresses).
+  const [suggestions, setSuggestions] = useState([]);
+  useEffect(() => {
+    const q = address.trim();
+    if (q.length < 3) {
+      setSuggestions([]);
+      return undefined;
+    }
+    let current = true;
+    const timer = setTimeout(() => {
+      getAddresses(q).then((results) => {
+        if (current) setSuggestions(results);
+      }).catch(() => {
+        if (current) setSuggestions([]);
+      });
+    }, 150);
+    return () => {
+      current = false;
+      clearTimeout(timer);
+    };
+  }, [address]);
+  const picked = suggestions.find((s) => sameAddress(s.address, address));
 
   return (
     <form
@@ -120,24 +172,47 @@ function CallForm({ defaultPhone, onSubmit }) {
       onSubmit={async (e) => {
         e.preventDefault();
         setBusy(true);
-        await onSubmit(phone, address);
+        await onSubmit(phone, address, picked?.model_id || null);
         setBusy(false);
       }}
     >
-      <h2>Incoming 911 call</h2>
+      <h2 className="side-title">New call</h2>
       <label>
         Caller phone
         <input value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="+1 609 555 0100" required />
       </label>
       <label>
         Address
-        <input value={address} onChange={(e) => setAddress(e.target.value)} required />
+        <input
+          value={address}
+          onChange={(e) => setAddress(e.target.value)}
+          list="address-suggestions"
+          autoComplete="off"
+          placeholder="Any Houston or Los Angeles address"
+          required
+        />
+        <datalist id="address-suggestions">
+          {suggestions.map((s) => (
+            <option key={s.model_id} value={s.address}>
+              {`${s.segment === "residential" ? "House" : "Commercial"}, ${s.rooms ?? "?"} rooms${s.floors > 1 ? `, ${s.floors} floors` : ""}${s.cached ? ", ready" : ""}`}
+            </option>
+          ))}
+        </datalist>
       </label>
+      {(suggestions.length > 0 || picked) && (
+        <Suspense fallback={<div className="address-map" />}>
+          <AddressMap suggestions={suggestions} picked={picked} onPick={(s) => setAddress(s.address)} />
+        </Suspense>
+      )}
       <button type="submit" className="primary" disabled={busy}>
         {busy ? "Starting…" : "Start call"}
       </button>
     </form>
   );
+}
+
+function capitalize(text) {
+  return text ? text[0].toUpperCase() + text.slice(1) : text;
 }
 
 function StatusPill({ status }) {
@@ -146,6 +221,7 @@ function StatusPill({ status }) {
 
 function SessionView({ session, building, config }) {
   const [showPhoto, setShowPhoto] = useState(false);
+  const [planMode, setPlanMode] = useState("plan"); // "plan" (schematic) or "map" (real surroundings)
   // Room whose photos are shown; null follows the current best estimate.
   const [pickedRoom, setPickedRoom] = useState(null);
   // Floor shown on the plan; null follows the floor of the current best estimate.
@@ -168,23 +244,35 @@ function SessionView({ session, building, config }) {
 
   return (
     <div className="session-view">
-      <section className="status-bar">
-        <div>
+      <section className={`incident incident-${session.status}`}>
+        <div className="incident-where">
           <StatusPill status={session.status} />
-          <span className="status-detail">{session.status_detail}</span>
+          {estimate ? (
+            <p className="incident-room">
+              {estimate.room_name}
+              {multiFloor && <span className="incident-floor">{estimate.floor_label}</span>}
+            </p>
+          ) : (
+            <p className="incident-room incident-none">
+              {session.status === "listening" ? "No estimate yet" : session.status_detail}
+            </p>
+          )}
+          {session.danger && <p className="match match-approx">Caller reported danger</p>}
+          {estimate?.zone_label && <p className="incident-zone">{capitalize(estimate.zone_label)}</p>}
         </div>
-        <div className="status-numbers">
-          <span>
-            Questions {session.questions_asked}/{session.max_questions}
-          </span>
+        <div className="incident-numbers">
           {estimate && (
-            <span>
-              Top room <strong>{estimate.room_name}</strong>
-              {multiFloor ? ` (${estimate.floor_label})` : ""} {pct(estimate.room_probability)} (next{" "}
-              {pct(estimate.runner_up_probability)}) · spot ±{estimate.radius_m?.toFixed(1)} m
-            </span>
+            <p className="incident-odds">
+              <span className="incident-pct">{pct(estimate.room_probability)}</span>
+              <span className="muted">next best {pct(estimate.runner_up_probability)}</span>
+            </p>
           )}
         </div>
+        {session.status === "best_guess" && checkOrder(session.rooms) && (
+          <p className="check-first">
+            Search in this order: <strong>{checkOrder(session.rooms)}</strong>
+          </p>
+        )}
       </section>
 
       <section className="panel plan-panel">
@@ -193,23 +281,47 @@ function SessionView({ session, building, config }) {
             <h2>{building ? building.address : session.address}</h2>
             <MatchNote session={session} />
           </div>
-          {floorplan && (
-            <label className="toggle">
-              <input type="checkbox" checked={showPhoto} onChange={(e) => setShowPhoto(e.target.checked)} />
-              Aerial photo
-            </label>
+        </div>
+        <div className="plan-controls">
+          <div className="panel-tools">
+            {floorplan && planMode === "plan" && (
+              <label className="toggle">
+                <input type="checkbox" checked={showPhoto} onChange={(e) => setShowPhoto(e.target.checked)} />
+                Aerial photo
+              </label>
+            )}
+            {building && (
+              <div className="segmented" role="group" aria-label="Plan view">
+                <button type="button" aria-pressed={planMode === "plan"} className={planMode === "plan" ? "active" : ""} onClick={() => setPlanMode("plan")}>
+                  Plan
+                </button>
+                <button type="button" aria-pressed={planMode === "map"} className={planMode === "map" ? "active" : ""} onClick={() => setPlanMode("map")}>
+                  Map
+                </button>
+              </div>
+            )}
+          </div>
+          {building && multiFloor && (
+            <FloorTabs
+              floors={session.floors.length ? session.floors : building.floors}
+              shown={shownFloor}
+              estimateFloor={estimate?.floor}
+              followsEstimate={pickedFloor === null}
+              onPick={setPickedFloor}
+            />
           )}
         </div>
-        {building && multiFloor && (
-          <FloorTabs
-            floors={session.floors.length ? session.floors : building.floors}
-            shown={shownFloor}
-            estimateFloor={estimate?.floor}
-            followsEstimate={pickedFloor === null}
-            onPick={setPickedFloor}
-          />
-        )}
-        {building ? (
+        {building && planMode === "map" ? (
+          <Suspense fallback={<div className="plan-placeholder">Loading map…</div>}>
+            <MapView
+              building={building}
+              session={session}
+              floor={shownFloor}
+              selectedRoom={shownRoom}
+              onSelectRoom={pickRoom}
+            />
+          </Suspense>
+        ) : building ? (
           <FloorPlan
             building={building}
             session={session}
@@ -225,6 +337,7 @@ function SessionView({ session, building, config }) {
               : "Loading interior model…"}
           </div>
         )}
+        {building && <ApproachCard session={session} />}
         {building && (
           <RoomPhotos
             session={session}
@@ -237,7 +350,7 @@ function SessionView({ session, building, config }) {
 
       <section className="panel conversation-panel">
         <h2>Conversation</h2>
-        <Conversation messages={session.messages} />
+        <Conversation messages={session.messages} evidence={session.evidence} />
         <CallerBox session={session} mode={config?.messaging_mode} />
       </section>
 
@@ -245,47 +358,102 @@ function SessionView({ session, building, config }) {
         <h2>Room probabilities</h2>
         {session.rooms.length === 0 ? (
           <p className="muted">Waiting for the building to load.</p>
+        ) : !estimate && session.status === "listening" ? (
+          <p className="muted">No room evidence yet.</p>
         ) : (
-          <ul className="room-bars">
-            {session.rooms.map((room) => (
-              <li key={room.index}>
-                <button
-                  type="button"
-                  className={room.index === shownRoom ? "room-row selected" : "room-row"}
-                  onClick={() => pickRoom(room.index)}
-                  title="Show this room's photos"
-                >
-                  <span className="room-name">
-                    {room.name}
-                    {multiFloor && <span className="room-floor"> · {room.floor_label}</span>}
-                  </span>
-                  <span className="bar">
-                    <span style={{ width: pct(room.probability) }} />
-                  </span>
-                  <span className="room-pct">{pct(room.probability)}</span>
-                </button>
-              </li>
-            ))}
-          </ul>
+          <RoomBars session={session} shownRoom={shownRoom} multiFloor={multiFloor} onPick={pickRoom} />
         )}
       </section>
     </div>
   );
 }
 
-// Every photo of one room, grouped by scan point, from GET /api/sessions/{id}/rooms. Photos don't change during a
-// call, so they are fetched once per session/building; probabilities come from the live session snapshot.
+// The room list, most likely first. Rooms the backend can't tell apart yet (snapshot `tie_group`, when present) are
+// bracketed together so the dispatcher doesn't read the order inside the group as meaningful.
+function RoomBars({ session, shownRoom, multiFloor, onPick }) {
+  const tie = (session.tie_group || []).length >= 2 ? new Set(session.tie_group.map((r) => r.index)) : new Set();
+  const topIndex = session.rooms[0]?.index;
+  const row = (room) => (
+    <RoomRow
+      key={room.index}
+      room={room}
+      selected={room.index === shownRoom}
+      multiFloor={multiFloor}
+      onPick={onPick}
+      confidence={room.index === topIndex && !tie.has(room.index) ? { status: session.status } : null}
+    />
+  );
+  const items = [];
+  let tieShown = false;
+  for (const room of session.rooms) {
+    if (!tie.has(room.index)) {
+      items.push(row(room));
+    } else if (!tieShown) {
+      tieShown = true;
+      items.push(
+        <li key="tie" className="tie-group">
+          <span className="tie-label">Can't tell apart yet</span>
+          <ul className="room-bars">{session.rooms.filter((r) => tie.has(r.index)).map(row)}</ul>
+        </li>,
+      );
+    }
+  }
+  return <ul className="room-bars">{items}</ul>;
+}
+
+function RoomRow({ room, selected, multiFloor, onPick, confidence }) {
+  return (
+    <li>
+      <button
+        type="button"
+        className={selected ? "room-row selected" : "room-row"}
+        onClick={() => onPick(room.index)}
+        title="Show this room's photos"
+      >
+        <span className="room-name">
+          <span className="room-name-text">
+            {room.name}
+            {multiFloor && <span className="room-floor">{room.floor_label}</span>}
+          </span>
+          {room.has_photos === false && (
+            <span className="room-badge muted-badge" title="Found from the caller's words only">
+              no photos
+            </span>
+          )}
+          {confidence && <ConfidenceTag status={confidence.status} probability={room.probability} />}
+        </span>
+        <span className="bar">
+          <span style={{ width: `${Math.round((room.probability || 0) * 100)}%` }} />
+        </span>
+        <span className="room-pct">{pct(room.probability)}</span>
+      </button>
+    </li>
+  );
+}
+
+function ConfidenceTag({ status, probability }) {
+  const { word, tone } = confidenceWord(status, probability);
+  return <span className={`conf conf-${tone}`}>{word}</span>;
+}
+
+// Every photo of one room, grouped by scan point, from GET /api/sessions/{id}/rooms. Re-fetched after each message,
+// since the scan points are ordered by the live estimate; the panel keeps the old photos until the new list arrives.
 function RoomPhotos({ session, roomIndex, followsEstimate, onFollowEstimate }) {
   const [rooms, setRooms] = useState(null);
   const [error, setError] = useState("");
   const ready = session.rooms.length > 0;
   useEffect(() => {
-    if (!ready) return;
     setRooms(null);
+  }, [session.id]);
+  useEffect(() => {
+    if (!ready) return;
+    setError("");
+    let current = true;
     getRoomShots(session.id)
-      .then((data) => setRooms(data.rooms))
-      .catch((e) => setError(e.message));
-  }, [session.id, session.model_id, ready]);
+      .then((data) => { if (current) setRooms(data.rooms); })
+      .catch((e) => { if (current) setError(e.message); });
+    return () => { current = false; };
+  }, [session.id, session.model_id, ready, session.messages.length]);
 
   if (error) return <p className="error">{error}</p>;
   if (!rooms || roomIndex === null) return null;
@@ -297,9 +465,12 @@ function RoomPhotos({ session, roomIndex, followsEstimate, onFollowEstimate }) {
     <div className="views">
       <div className="views-head">
         <h3>
-          {room.name} · {pct(live?.probability)}
-          {room.area_m2 ? ` · ${room.area_m2} m²` : ""}
-          {followsEstimate ? " (most likely room)" : ""}
+          Photos of {room.name}
+          <span className="views-sub">
+            {followsEstimate ? "most likely room, " : ""}
+            {pct(live?.probability)}
+            {room.area_m2 ? `, ${room.area_m2} m²` : ""}
+          </span>
         </h3>
         {!followsEstimate && (
           <button type="button" className="link" onClick={onFollowEstimate}>
@@ -313,9 +484,7 @@ function RoomPhotos({ session, roomIndex, followsEstimate, onFollowEstimate }) {
         room.sweeps.map((sweep, i) => (
           <div key={sweep.candidate} className="sweep-shots">
             <span className="muted">
-              {i === 0 && followsEstimate && room.sweeps.length > 1
-                ? `Most likely spot (${pct(liveScan(session, sweep.candidate))})`
-                : `Scan point ${i + 1} of ${room.sweeps.length}`}
+              Scan point {i + 1} of {room.sweeps.length}
             </span>
             <div className="view-strip">
               {sweep.views.map((url) => (
@@ -354,33 +523,48 @@ function FloorTabs({ floors, shown, estimateFloor, followsEstimate, onPick }) {
   );
 }
 
-// Live probability of one scan point (the photos list is fetched once; probabilities change every reply).
-const liveScan = (session, candidate) => session.candidate_probabilities?.[candidate] ?? 0;
-
 // Which Matterport property the call is using. A non-exact match is highlighted so the dispatcher confirms it.
 function MatchNote({ session }) {
   const match = session.match;
   if (!match) return null;
-  if (match.exact) return <p className="match match-exact">Exact address match</p>;
+  if (match.exact) return null;
   return (
     <p className="match match-approx" title={`Caller address: ${session.address}`}>
-      Closest match to “{session.address}” · {pct(match.score)} similar. Confirm with the caller.
+      Closest match to “{session.address}” ({pct(match.score)} similar). Confirm the address with the caller.
     </p>
   );
 }
 
-function Conversation({ messages }) {
-  const end = useRef(null);
-  useEffect(() => end.current?.scrollIntoView({ block: "end" }), [messages.length]);
+// Each caller message is followed by its effect on the room probabilities, from the snapshot's evidence log. Entries
+// are matched by timestamp, then by text (each entry used once) in case a backend rounds the timestamp.
+function Conversation({ messages, evidence = [] }) {
+  const list = useRef(null);
+  useEffect(() => {
+    if (list.current) list.current.scrollTop = list.current.scrollHeight;
+  }, [messages.length, evidence.length]);
+  const used = new Set();
+  const effectFor = (m) => {
+    let entry = evidence.find((e, i) => !used.has(i) && (m.id ? e.message_id === m.id : e.ts === m.ts && e.text === m.text));
+    entry ??= evidence.find((e, i) => !used.has(i) && e.text === m.text);
+    if (entry) used.add(evidence.indexOf(entry));
+    return entry;
+  };
   return (
-    <ol className="messages">
-      {messages.map((m, i) => (
-        <li key={i} className={`msg msg-${m.role}`}>
-          <span className="msg-who">{m.role === "dispatch" ? "To caller" : m.role === "caller" ? "Caller" : "System"}</span>
-          <span className="msg-text">{m.text}</span>
-        </li>
-      ))}
-      <li ref={end} />
+    <ol className="messages" ref={list}>
+      {messages.map((m, i) => {
+        const entry = m.role === "caller" ? effectFor(m) : null;
+        return (
+          <li key={i} className={`msg msg-${m.role}`}>
+            <span className="msg-who">{m.role === "dispatch" ? "To caller" : m.role === "caller" ? "Caller" : "Operator note"}</span>
+            <span className="msg-text">{m.text}</span>
+            {entry && (
+              <span className="msg-effect" title={`Top room before this message: ${entry.top_before}`}>
+                {entry.note || describeEffect(entry)}
+              </span>
+            )}
+          </li>
+        );
+      })}
     </ol>
   );
 }
@@ -388,15 +572,17 @@ function Conversation({ messages }) {
 function CallerBox({ session, mode }) {
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
-  const open = session.status === "listening" || session.status === "loading";
+  const open = !session.ended && ["listening", "loading", "located", "best_guess"].includes(session.status) && session.channel !== "voice";
   const quick = ["Yes", "No", "I don't know"];
 
   async function send(value) {
     if (!value.trim()) return;
+    setText("");   // the message shows in the conversation right away (live update); no need to wait for the reply
     setBusy(true);
     try {
       await sendReply(session.id, value);
-      setText("");
+    } catch {
+      setText(value);   // give the text back if it didn't go through
     } finally {
       setBusy(false);
     }
@@ -419,7 +605,7 @@ function CallerBox({ session, mode }) {
           value={text}
           onChange={(e) => setText(e.target.value)}
           placeholder={open ? "e.g. There's a stove and a fridge" : "Call is no longer collecting replies"}
-          disabled={!open || busy}
+          disabled={!open}
         />
         <button type="submit" className="primary" disabled={!open || busy || !text.trim()}>
           Send
@@ -435,5 +621,3 @@ function CallerBox({ session, mode }) {
     </form>
   );
 }
-
-const pct = (p) => `${Math.round((p || 0) * 100)}%`;

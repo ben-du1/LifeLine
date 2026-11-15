@@ -71,7 +71,8 @@ class VoicePipelineTests(unittest.IsolatedAsyncioTestCase):
             estimate = manager.snapshot(session)["estimate"]
             self.assertEqual(estimate["floor"], 0)
             self.assertEqual(estimate["room_name"], "Kitchen")
-            self.assertEqual(session.status, "located")
+            self.assertEqual(session.status, "listening")
+            self.assertEqual(session.pending.purpose, "verify")
             self.assertNotIn("help is on the way", session.messages[-1]["text"])
             send.assert_not_awaited()
 

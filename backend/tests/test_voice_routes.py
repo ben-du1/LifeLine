@@ -1,6 +1,8 @@
 """HTTP authentication and schema checks without starting the app or a real agent."""
 
-import asyncio
+import hmac
+import json
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -32,6 +34,22 @@ class VoiceRouteTests(unittest.TestCase):
                 "conversation_id": "c", "history": "invalid"}).status_code, 400)
         with patch.object(config, "VOICE_TOOL_TOKEN", ""), TestClient(app) as client:
             self.assertEqual(client.post("/api/voice/start", json=body).status_code, 503)
+
+
+    def test_application_loads_and_authenticates_post_call_webhook(self):
+        from app.main import app
+
+        routes = {route.path for route in app.routes if hasattr(route, "path")}
+        self.assertIn("/api/calls", routes)
+        event = {"type": "post_call_transcription", "data": {"conversation_id": "unknown"}}
+        body = json.dumps(event).encode()
+        timestamp = str(int(time.time()))
+        signature = hmac.digest(b"test-secret", timestamp.encode() + b"." + body, "sha256").hex()
+        with patch.dict("os.environ", {"ELEVENLABS_POST_CALL_SECRET": "test-secret"}):
+            client = TestClient(app)
+            self.assertEqual(client.post("/api/voice/post-call", content=body).status_code, 401)
+            headers = {"ElevenLabs-Signature": f"t={timestamp},v0={signature}"}
+            self.assertEqual(client.post("/api/voice/post-call", content=body, headers=headers).status_code, 200)
 
 
 if __name__ == "__main__":

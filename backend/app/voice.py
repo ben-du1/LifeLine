@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -19,11 +20,14 @@ class VoiceError(ValueError):
 class VoiceCall:
     session: "Session"
     delivered: int = 0
+    offered: int = 0
+    expiry: asyncio.TimerHandle | None = None
+    loading_deadline: float = field(default_factory=lambda: time.monotonic() + 60)
     replies: dict[int, tuple[str, dict]] = field(default_factory=dict)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
-def latest_reply(history: str) -> tuple[int, str]:
+def caller_messages(history: str) -> list[str]:
     """Use the platform transcript rather than an LLM paraphrase of a caller's answer."""
     try:
         entries = json.loads(history)["entries"]
@@ -35,22 +39,12 @@ def latest_reply(history: str) -> tuple[int, str]:
         raise VoiceError("The conversation has no caller answer.")
     if len(users[-1]) > 8000:
         raise VoiceError("Caller answer is too long.")
+    return users
+
+
+def latest_reply(history: str) -> tuple[int, str]:
+    users = caller_messages(history)
     return len(users), users[-1]
-
-
-def spoken_message(text: str) -> str:
-    """Keep the MVP's question wording without claiming a demo dispatched real responders."""
-    return (text.replace(
-        "This is 911 emergency services. We're working to find you inside the building.",
-        "This is the HackPrinceton caller-location demo.")
-        .replace("Responders now know which room you're in", "The demo estimates you're in this room")
-        .replace("Stay where you are; help is on the way.", "You can correct this estimate if needed.")
-        .replace("Responders have your approximate location.", "The demo has an approximate location estimate.")
-        .replace("Stay where you are and keep your phone with you.", "You can correct this estimate if needed.")
-        .replace("Thank you. Stay where you are if it is safe; responders are on the way to your address.",
-                 "The demo could not find an interior model for this address.")
-        .replace("Thank you, that helps responders find you. Stay where you are.",
-                 "Thank you, that refines the demo's location estimate."))
 
 
 class VoiceBridge:
@@ -76,51 +70,84 @@ class VoiceBridge:
                     phone or f"voice:{conversation_id}", address, channel="voice")
                 call = VoiceCall(session)
                 self.calls[conversation_id] = call
+                loop = asyncio.get_running_loop()
+                def expire():
+                    asyncio.create_task(self.end(conversation_id, "Voice interview reached its time limit."))
+                call.expiry = loop.call_later(240, expire)
             elif call.session.address != address.strip():
                 raise VoiceError("This conversation already has a different building address.", 409)
         # A retry returns the opening again but never starts another session.
         return {"session_id": call.session.id, "status": call.session.status, "pending": False,
-                "say": spoken_message(call.session.messages[0]["text"]),
-                "instruction": "Ask this question. If the caller already described the room, submit that answer now."}
+                "say": call.session.messages[0]["text"],
+                "response_id": 0, "instruction": "Ask this question. If the caller already described the room, submit that answer now."}
 
-    async def reply(self, conversation_id: str, history: str) -> dict:
-        turn, text = latest_reply(history)
+    async def reply(self, conversation_id: str, history: str, acknowledge: int | None = None) -> dict:
+        users = caller_messages(history)
+        turn, text = len(users), users[-1]
         call = self._call(conversation_id)
         async with call.lock:
+            if any(users[n - 1] != old for n, (old, _) in call.replies.items() if n <= turn):
+                raise VoiceError("A processed transcript turn cannot be changed.", 409)
             if turn in call.replies:
                 previous_text, response = call.replies[turn]
                 if previous_text != text:
                     raise VoiceError("A processed transcript turn cannot be changed.", 409)
+                if response["pending"] and call.session.ready.is_set():
+                    response = await self._result(call, acknowledge)
+                    call.replies[turn] = (text, response)
                 return response
             if call.replies and turn < max(call.replies):
                 raise VoiceError("This transcript is older than the last processed answer.", 409)
             # If loading is unfinished, handle_reply queues the exact answer for _load.
             # Skip all earlier messages, including the opening already returned by start.
             call.delivered = max(call.delivered, 1)
-            await self.manager.handle_reply(call.session, text)
-            response = await self._result(call)
+            previous = max(call.replies, default=turn - 1)
+            await self.manager.handle_reply(call.session, " ".join(users[previous:]))
+            response = await self._result(call, acknowledge)
             call.replies[turn] = (text, response)
             return response
 
-    async def status(self, conversation_id: str) -> dict:
+    async def status(self, conversation_id: str, acknowledge: int | None = None) -> dict:
         call = self._call(conversation_id)
         async with call.lock:
-            return await self._result(call)
+            return await self._result(call, acknowledge)
 
-    async def _result(self, call: VoiceCall) -> dict:
+    async def end(self, conversation_id: str, reason: str) -> None:
+        call = self.calls.get(conversation_id)
+        if call is not None:
+            if call.expiry is not None:
+                call.expiry.cancel()
+            await self.manager.end_call(call.session, reason)
+
+    async def _result(self, call: VoiceCall, acknowledge: int | None = None) -> dict:
         session = call.session
+        if acknowledge is not None:
+            if acknowledge > call.offered:
+                raise VoiceError("Unknown response cursor.", 409)
+            call.delivered = max(call.delivered, acknowledge)
+        if getattr(session, "ended", False):
+            return {"session_id": session.id, "status": session.status, "pending": False,
+                    "say": "The location interview has ended.", "response_id": call.offered}
         try:
             await asyncio.wait_for(session.ready.wait(), timeout=self.wait_seconds)
         except TimeoutError:
+            if time.monotonic() >= call.loading_deadline:
+                if call.expiry is not None:
+                    call.expiry.cancel()
+                await self.manager.end_call(session, "Voice interview timed out while loading the building.")
+                return {"session_id": session.id, "status": "error", "pending": False,
+                        "say": "The building took too long to load.", "awaiting_answer": False}
             return {"session_id": session.id, "status": "loading", "pending": True,
                     "say": "I'm still loading the building's interior.",
                     "instruction": "Call location_status again. Do not resubmit the caller's answer."}
-        messages = [spoken_message(m["text"]) for m in session.messages[call.delivered:]
+        messages = [m["text"] for m in session.messages[call.delivered:]
                     if m["role"] == "dispatch"]
-        call.delivered = len(session.messages)
+        call.offered = len(session.messages)
+        if acknowledge is None:
+            call.delivered = call.offered
         if session.status == "error":
-            messages = ["The demo could not process the building. Please check the dispatcher dashboard."]
+            messages = ["The floor plan could not be loaded."]
         return {"session_id": session.id, "status": session.status, "pending": False,
-                "say": " ".join(messages) or "Thank you. The demo has recorded your answer.",
-                "awaiting_answer": session.pending is not None,
+                "say": " ".join(messages) or "Thank you. Your answer has been recorded.",
+                "awaiting_answer": session.pending is not None, "response_id": call.offered,
                 "instruction": "Say the returned text exactly. Accept corrections; do not invent another question."}

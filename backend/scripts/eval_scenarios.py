@@ -1,20 +1,31 @@
 """Truthful scripted callers run through the real SessionManager (simulated messaging).
 
-Usage (from backend/): .venv/Scripts/python scripts/eval_scenarios.py [-v]
-Each caller opens with a description (often vague, like "I'm in a cramped space") and then answers the planned
-follow-ups from a fact sheet of what the room really contains. -v prints every question asked.
+Usage (from backend/): .venv/Scripts/python scripts/eval_scenarios.py [-v] [--noisy]
+Each caller opens with a description (often vague, like "I'm in a cramped space") and then answers every question
+the system asks, including the checks before "located" and the questions after it, from a fact sheet of what the room
+really contains. -v prints every message.
+  - Photo facts (stove, window, flooring, ...) were checked against the sweeps' photos. Features not listed are
+    answered "no"; choices not listed "I don't know".
+  - Layout questions (doors, window count, street view, front or back of the house) are answered from Matterport's
+    own door/window annotation and floor plan of the true room, i.e. a caller who knows their room's doors and windows. That is the same data the model uses, so
+    --noisy also runs every scenario with 15% of answers wrong (fixed seed) to show what happens when callers err.
 The sample house (13122 Chipman Glen) is vacant: empty bedrooms, no furniture. Its bathrooms have no photos.
 """
 import asyncio
+import random
+import re
 import sys
 
 sys.path.insert(0, ".")
 from app import followups
 from app.sessions import SessionManager
 
+NOISE = 0.15
+
 CHIPMAN = "13122 Chipman Glen Dr, Houston, TX"
 POINTER = "7921 Pointer St, Houston, TX"
 HOUSTON_AVE = "3012 Houston Ave, Houston, TX"   # 4 floors, 60 rooms (multi-floor scenarios)
+W35 = "1348 W 35th St, Los Angeles, CA 90007"    # 3 floors, 7 bedrooms (3 on the top floor), 7 bathrooms
 
 # (address, true room name, opening message, facts). Facts: feature key -> "yes"; choice key -> answer text.
 # Features not listed are answered "no"; choices not listed are answered "I don't know".
@@ -57,19 +68,57 @@ SCENARIOS = [
     (HOUSTON_AVE, "Kitchen", "I'm in the kitchen",   # there is a kitchen on floor 1 and another on floor 2
      {"stove": "yes", "fridge": "yes", "sink": "yes", "window": "yes", "flooring": "tile", "size": "bigger",
       "floor": "ground floor"}),
+    # Look-alike rooms: four empty bedrooms and two photo-less bathrooms, told apart only by doors and windows.
+    (CHIPMAN, "Bedroom 2", "I'm in a bedroom", {"window": "yes", "size": "medium", "flooring": "carpet"}),
+    (CHIPMAN, "Bedroom 3", "I'm in an empty bedroom", {"window": "yes", "size": "medium", "flooring": "carpet"}),
+    (CHIPMAN, "Bedroom 4", "I'm in a small bedroom with no windows", {"size": "medium", "flooring": "carpet"}),
+    (CHIPMAN, "Bathroom 2", "I'm in the bathroom",
+     {"toilet": "yes", "sink": "yes", "mirror": "yes", "size": "closet-sized", "flooring": "tile"}),
+    # A room name used as a comparison is not a claim ("big like a living room" from a bedroom).
+    (POINTER, "Bedroom 3", "it's a big room with a bed",
+     {"bed": "yes", "window": "yes", "fan": "yes", "size": "big like a living room"}),
+    # A wrong claim must be caught by the check, not confirmed: the caller thinks it's the kitchen.
+    (POINTER, "Living Room / Dining Room", "I think I'm in the kitchen",
+     {"window": "yes", "size": "bigger", "front_door": "yes"}),
+    # A live call: "I'm in a bedroom", then the floor as a bare number, or "I don't know" (then the stairs question).
+    (W35, "Bedroom 6", "I’m in a bedroom", {"floor": "3", "size": "medium"}),
+    (W35, "Bedroom 6", "I’m stuck in a bedroom", {"flights": "two flights", "size": "medium"}),
 ]
 
 
-def answer(plan: followups.Plan, facts: dict) -> str:
+def truthful(plan: followups.Plan, facts: dict, model, truth: list[int]) -> str:
+    """The answer a caller in the true room gives (`truth`: its candidate indices)."""
     if plan.kind == "yesno":
-        return facts.get(plan.key, "no")
+        if plan.key in facts:
+            return facts[plan.key]
+        # Layout features, and windows when the fact sheet is silent, from Matterport's annotation of the room.
+        if plan.key in followups.LAYOUT_FEATURES or (plan.key == "window" and "windows" in model.p_option):
+            return "yes" if model.p_yes[plan.key][truth].mean() > 0.5 else "no"
+        return "no"
     if plan.kind == "choice":
-        return facts.get(plan.key, "I don't know")
+        if plan.key in facts:
+            return facts[plan.key]
+        if plan.key in ("windows", "door_to", "position"):
+            return plan.options[int(model.p_option[plan.key][:, truth].mean(axis=1).argmax())].label
+        return "I don't know"
     seen = [followups.FEATURES_BY_KEY[k].noun.split(" or ")[0] for k in plan.items if facts.get(k) == "yes"]
     return f"I see {' and '.join(seen)}" if seen else "none of those"
 
 
-async def run(address, truth, opening, facts, verbose):
+def answer(plan: followups.Plan, facts: dict, model, truth: list[int], rng: random.Random | None) -> str:
+    """Truthful answer, or with --noisy a wrong one 15% of the time (yes/no flipped, another option chosen)."""
+    said = truthful(plan, facts, model, truth)
+    if rng is None or rng.random() >= NOISE:
+        return said
+    if plan.kind == "yesno":
+        return "no" if said == "yes" else "yes"
+    if plan.kind == "choice":
+        others = [o.label for o in plan.options if not re.search(o.words, said, re.I)]
+        return rng.choice(others) if others else said
+    return "none of those" if said.startswith("I see") else said
+
+
+async def run(index, address, truth, opening, facts, verbose, noisy):
     async def notify(_):
         pass
 
@@ -77,12 +126,20 @@ async def run(address, truth, opening, facts, verbose):
     session = await manager.start_call("+10000000000", address)
     while session.status == "loading":
         await asyncio.sleep(0.1)
+    loaded = manager.buildings[session.model_id]
+    true_room = next(i for i, r in enumerate(loaded.building.rooms) if r["name"] == truth)
+    true_cands = [int(c) for c in (loaded.building.candidate_room == true_room).nonzero()[0]]
+    rng = random.Random(index) if noisy else None
     await manager.handle_reply(session, opening)
-    while session.status == "listening":
-        await manager.handle_reply(session, answer(session.pending, facts))
+    # Answer everything asked, including the check before "located" and the questions after it; stop at the
+    # in-room "what's closest" questions (scored separately) or when nothing is pending.
+    while session.pending is not None and session.pending.kind != "nearest" and len(session.messages) < 80:
+        await manager.handle_reply(session, answer(session.pending, facts, loaded.features, true_cands, rng))
     snap = manager.snapshot(session)
     top = snap["rooms"][0]
-    ok = "OK " if top["name"] == truth else "BAD"
+    ok = top["name"] == truth
+    told = [m["text"] for m in session.messages if m["role"] == "dispatch" and "will look for you in" in m["text"]]
+    told_wrong = any(f"in the {truth}." not in t and f"in the {truth}," not in t for t in told)
     floor_note = ""
     if len(snap["floors"]) > 1:  # also report whether the floor is right, even when the room isn't
         true_floor = next(r["floor_label"] for r in snap["rooms"] if r["name"] == truth)
@@ -90,19 +147,28 @@ async def run(address, truth, opening, facts, verbose):
         floor_note = (f"  floor {'OK' if best_floor['label'] == true_floor else 'BAD'} "
                       f"({best_floor['label']} {best_floor['probability']:.2f})")
     rest = ", ".join(f"{r['name']}={r['probability']:.2f}" for r in snap["rooms"][1:3])
-    print(f"{ok} {truth[:22]:22} <- {opening!r:55} -> {session.status:10} {top['name']}={top['probability']:.2f} "
-          f"({rest})  {len(session.asked)} follow-ups{floor_note}")
+    checked = " checked" if snap["estimate"]["checked"] else ""
+    print(f"{'OK ' if ok else 'BAD'} {truth[:22]:22} <- {opening!r:48} -> {session.status:10}{checked:8} "
+          f"{top['name'][:24]}={top['probability']:.2f} ({rest})  {len(session.asked)} q"
+          f"{'  TOLD WRONG ROOM' if told_wrong else ''}{floor_note}")
     if verbose:
         for m in session.messages:
             if m["role"] != "system":
                 print(f"      {m['role']:8}: {m['text']}")
-    return ok == "OK "
+    return {"ok": ok, "confidently_wrong": session.status == "located" and not ok, "told_wrong": told_wrong,
+            "questions": len(session.asked)}
 
 
 async def main():
     verbose = "-v" in sys.argv
-    results = [await run(*scenario, verbose) for scenario in SCENARIOS]
-    print(f"\n{sum(results)}/{len(results)} correct")
+    for noisy in ([False, True] if "--noisy" in sys.argv else [False]):
+        print(f"\n=== {'noisy callers (15% wrong answers)' if noisy else 'truthful callers'}")
+        results = [await run(i, *scenario, verbose, noisy) for i, scenario in enumerate(SCENARIOS)]
+        n = len(results)
+        print(f"\n{sum(r['ok'] for r in results)}/{n} correct top room · "
+              f"{sum(r['confidently_wrong'] for r in results)} located in the wrong room at the end · "
+              f"{sum(r['told_wrong'] for r in results)} callers told a wrong room at some point · "
+              f"{sum(r['questions'] for r in results) / n:.1f} questions on average")
 
 
 asyncio.run(main())

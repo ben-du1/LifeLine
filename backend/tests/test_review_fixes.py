@@ -181,6 +181,8 @@ def test_confirmation_with_a_description_is_read_after_loading(sent):
         assert s.waiting_for_match
         await m.handle_reply(s, "yes, I'm in the bedroom by the bed")
         await settle(s)
+        # status turns "listening" just before the queued description is read; wait for the whole load to finish
+        await asyncio.wait_for(s.ready.wait(), 5)
         assert s.status in ("listening", "located", "best_guess") and s.model_id == HOUSE.model_id
         assert s.evidence and m.snapshot(s)["rooms"][0]["name"] == "Bedroom"
     asyncio.run(run())

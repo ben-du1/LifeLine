@@ -221,7 +221,13 @@ button.session.active { background: var(--surface); border-color: var(--border);
 .match-exact { color: var(--ok); }
 .match-approx { color: var(--warn); font-weight: 600; }
 .toggle { font-size: 0.75rem; color: var(--muted); display: flex; gap: 5px; align-items: center; white-space: nowrap; }
-.floorplan { width: 100%; height: auto; max-height: 62vh; background: var(--map); border: 1px solid var(--border); }
+.floorplan-viewer {
+  position: relative;
+  min-height: 84px;
+  background: var(--map);
+  border: 1px solid var(--border);
+}
+.floorplan { display: block; width: 100%; height: auto; max-height: 62vh; }
 
 .wall { stroke: var(--wall); stroke-width: 0.08; stroke-linecap: round; }
 .room-fill { fill: var(--room); stroke: none; cursor: pointer; transition: fill-opacity 0.4s; }
@@ -229,9 +235,18 @@ button.session.active { background: var(--surface); border-color: var(--border);
 .room-fill[data-selected] { stroke: var(--accent); stroke-width: 0.14; stroke-dasharray: 0.3 0.15; }
 .room-label { pointer-events: none; }
 /* Orientation: north arrow and the nearest street (OpenStreetMap). */
-.compass circle { fill: var(--surface); stroke: var(--border); stroke-width: 0.06; }
+.compass {
+  position: absolute;
+  top: 26px;
+  left: 26px;
+  width: 44px;
+  height: 44px;
+  overflow: visible;
+  pointer-events: none;
+}
+.compass circle { fill: var(--surface); stroke: var(--border); stroke-width: 1.5; }
 .compass path { fill: var(--accent); }
-.compass text { font-size: 0.6px; font-weight: 700; text-anchor: middle; fill: var(--text); }
+.compass text { font-size: 14px; font-weight: 700; text-anchor: middle; fill: var(--text); }
 .street-band { stroke: var(--muted); stroke-opacity: 0.35; stroke-width: 1.6; stroke-linecap: round; }
 .street-label { font-size: 0.5px; font-weight: 600; text-anchor: middle; dominant-baseline: middle; fill: var(--text); }
 .room-label { font-size: 0.42px; text-anchor: middle; fill: var(--text); paint-order: stroke; stroke: var(--surface); stroke-width: 0.08px; }

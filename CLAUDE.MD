@@ -10,8 +10,9 @@
 HackPrinceton Fall 2026 MVP (CoStar × Matterport track, deadline Nov 15 2026, 4 PM EST). A 911 dispatcher enters a
 caller's phone and address. The system finds the building's Matterport digital twin, texts the caller (Photon
 iMessage, or a simulated caller box), asks follow-up questions, and puts a dot on the room the caller is in.
-**README.md is the full spec and status page:** read its "Status" table first, and keep it current when behaviour
-changes.
+**AGENTS.md is the full spec and status page:** read its "Status" table first, and keep it current when behaviour
+changes. README.md is the public front page for judges (what it does, how it works, design challenges, future work):
+update it only when the story changes, not for every tuning detail.
 
 ## Layout
 - `backend/app/`: FastAPI (Python 3.11, CPU only). Start at `sessions.py`, which holds the call flow.
@@ -31,7 +32,7 @@ changes.
   `.venv/Scripts/python` can fail ("No module named app" or exit 127). Use
   `/c/Users/ben/desktop/coding/hackprinecton-mvp/backend/.venv/Scripts/python` and `cd` into `backend/` in the same
   command.
-- **Tests:** `cd backend && .venv/Scripts/python -m pytest -q` (279 tests; `tests/fakes.py` runs the real SessionManager offline with a fake CLIP).
+- **Tests:** `cd backend && .venv/Scripts/python -m pytest -q` (312 tests; `tests/fakes.py` runs the real SessionManager offline with a fake CLIP).
 - **Eval:** `cd backend && MESSAGING_MODE=simulated .venv/Scripts/python scripts/eval_scenarios.py -v`. It is slow
   the first time, because it ingests 3 buildings.
 - **Backend:** `cd backend && .venv/Scripts/python -m uvicorn app.main:app --port 8000`.
@@ -77,5 +78,5 @@ changes.
   the floor tabs and the per-floor plan. That building's "nearest street" is Woodland Street (Nominatim returns only
   the single nearest road, so a corner lot shows one street).
 - **Claude layer:** verify live once a key is provided.
-- **Known accuracy limits:** identical rooms, rooms without photos, and labels that contradict the photos (see the
-  README's "Evaluation").
+- **Known accuracy limits:** identical rooms, rooms without photos, and labels that contradict the photos (see
+  "Evaluation" in AGENTS.md).

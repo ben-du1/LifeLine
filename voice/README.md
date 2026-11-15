@@ -86,7 +86,7 @@ Restart both backend and gateway after changing VOICE_TOOL_TOKEN.
 
 The agent and its saved tool bindings have been verified, with eight Python checks and one
 gateway check passing. Live phone delivery and model inference were not verified by those
-checks. See the main README for the full architecture, environment reference, and demo steps.
+checks. See AGENTS.md at the repo root for the full architecture, environment reference, and demo steps.
 
 ## Checks without live calls
 

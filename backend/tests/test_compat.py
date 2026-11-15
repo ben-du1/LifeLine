@@ -53,7 +53,7 @@ def test_photo_gaps_and_mixed_photo_kinds_are_flagged():
 
 
 def test_identical_rooms_form_lookalike_groups():
-    # The README's tie: Chipman Glen's Bedrooms 2 and 3 (13 vs 14 m²). 16 m² vs 14.4 m² is within 20%.
+    # AGENTS.md's tie: Chipman Glen's Bedrooms 2 and 3 (13 vs 14 m²). 16 m² vs 14.4 m² is within 20%.
     rooms = [room("kitchen", ["Kitchen"]), room("b1", ["Bedroom"], size=4), room("b2", ["Bedroom"], size=3.8),
              room("b3", ["Bedroom"], size=3.0), room("c1", ["Closet"], polygon=False),
              room("c2", ["Closet"], polygon=False)]

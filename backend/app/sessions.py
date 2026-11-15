@@ -146,7 +146,7 @@ class SessionManager:
         session.channel = channel
         session.requested_model = model_id
         self.sessions[session.id] = session
-        # Texting the caller and loading the building happen in parallel (README step 2).
+        # Texting the caller and loading the building happen in parallel (AGENTS.md, "How it works" step 2).
         await self._say(session, questions.OPENING_MESSAGE)
         asyncio.create_task(self._load(session))
         return session

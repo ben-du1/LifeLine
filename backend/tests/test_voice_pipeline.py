@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 import numpy as np
 
-from app import config, semantics, sessions
+from app import config, resolve, semantics, sessions
 from app.voice import VoiceBridge
 from test_followups import make_model, make_two_floor_model
 
@@ -22,7 +22,9 @@ class VoicePipelineTests(unittest.IsolatedAsyncioTestCase):
         manager._get_building = AsyncMock(return_value=manager.buildings[building.id])
         manager._load_orientation = AsyncMock()
         match = {"id": building.id, "address": building.address, "exact": True, "score": 1.0}
-        with patch.object(sessions, "find_matches", return_value=[match]):
+        # The bridge opens the call through the intake (open_call -> resolve.resolve): resolve the address to this
+        # building without the catalog or Matterport's search.
+        with patch.object(resolve, "resolve", return_value=resolve.Resolution("match", [match], building.address)):
             bridge = VoiceBridge(manager, wait_seconds=1)
             await bridge.start("conversation", building.address, "+15555550100")
             session = bridge.calls["conversation"].session

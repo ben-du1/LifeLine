@@ -3,21 +3,23 @@
 import os
 from pathlib import Path
 
+from dotenv import dotenv_values
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = REPO_ROOT / "data"
 BUILDINGS_DIR = DATA_DIR / "buildings"
 
 
 def _load_dotenv(path: Path) -> None:
-    # Tiny .env reader so we don't need python-dotenv. Real environment variables win.
+    # python-dotenv parses quotes, `export` and comments the way the Node tools (--env-file) do. For a key listed
+    # twice the last value wins: the old reader kept the first, so a blank `VOICE_TOOL_TOKEN=` above the real one
+    # (left by an earlier setup run) shadowed it. Real environment variables still win. No ${VAR} expansion, so a
+    # secret containing "$" is read as written.
     if not path.exists():
         return
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip())
+    for key, value in dotenv_values(path, interpolate=False, encoding="utf-8").items():
+        if value is not None:   # a bare "NAME" line with no "=" sets nothing
+            os.environ.setdefault(key, value)
 
 
 _load_dotenv(REPO_ROOT / ".env")
@@ -199,3 +201,42 @@ VEXCEL_EXTRACT_URL = os.environ.get("VEXCEL_EXTRACT_URL", "https://api.vexcelgro
 AERIAL_SIZE_M = float(os.environ.get("AERIAL_SIZE_M", "110"))
 
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "")
+
+
+# ==== caller-initiated calls: one block per workstream; edit only your own block ====
+# ---- A: address matching (resolve.py, addresses.py)
+# resolve.py bands, over the same 0..1 score as ADDRESS_MATCH_THRESHOLD. "match" needs an exact address (house number
+# and street) scoring at least ADDRESS_MATCH_THRESHOLD. Anything else at or above ADDRESS_CLARIFY_THRESHOLD is asked
+# about once: "clarify" when the best model leads the next one by at least ADDRESS_CLARIFY_MARGIN, "choose" between
+# the top two when it doesn't. 0.65 keeps a swapped-digit house number (13212 for 13122 scores 0.79) and a missing
+# house number, but not a street that shares one word ("5819 Eldridge Glen Dr" scores 0.30). A neighbouring house
+# scores ~0.09 below the exact one (13120 vs 13122), so 0.10 makes two neighbours a choice when neither is exact.
+ADDRESS_CLARIFY_THRESHOLD = 0.65
+ADDRESS_CLARIFY_MARGIN = 0.10
+# How many catalog rows (catalog.py, ~15,000 models) are scored per caller address after the street-word prefilter.
+# Scoring is ~50 us per row, so 60 keeps resolve() in single milliseconds on a laptop.
+ADDRESS_CATALOG_CANDIDATES = 60
+# Per-request timeout (seconds) for Matterport's address search (3 GraphQL calls per address). The default 60 s kept a
+# caller with no reply for minutes on bad venue Wi-Fi; a search that slow is treated as failed and the cache and
+# catalog are used instead. Model downloads (ingest) keep the 60 s default.
+ADDRESS_SEARCH_TIMEOUT_S = 6
+# ---- B: intake and handoff (sessions.py, handoff.py, main.py)
+# Wrong or unknown addresses the caller gets to correct before the call is handed to standard 911. One retry: a
+# trapped caller should not spend minutes spelling an address this system can't serve anyway.
+ADDRESS_RETRIES = 1
+# A text from a number whose last call went quiet this long ago starts a new call instead of continuing the old one
+# (minutes since that call's last message).
+SESSION_REUSE_MINUTES = 30
+# ---- C: caller language (questions.py, semantics.py)
+# questions.looks_like_address: how many words a street name may have between the house number and the street
+# word ("13122 Chipman Glen Dr" is 2). Larger accepts longer names but also more sentences that merely contain a
+# number ("2 people are in the back bedroom by the door").
+ADDRESS_MAX_NAME_WORDS = 4
+# ---- D: voice and platform (voice.py, phones.py, .env loading)
+# A voice interview ends after this long even if the caller is still talking (the post-call webhook and the agent's
+# end_call tool normally end it first). 240 s was enough for room questions alone; the address intake (a retry or a
+# "Did you mean...?") adds about a minute, hence 300.
+VOICE_INTERVIEW_SECONDS = 300
+# How long the agent may keep a caller on "still loading the building" before the bridge gives up. Counted from the
+# moment the address resolves, not from the start of the call, so intake questions don't use it up.
+VOICE_LOADING_SECONDS = 60

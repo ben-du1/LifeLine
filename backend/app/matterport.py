@@ -11,14 +11,14 @@ class MatterportError(RuntimeError):
     pass
 
 
-def graphql(query: str, variables: dict | None = None) -> dict:
+def graphql(query: str, variables: dict | None = None, timeout: float = 60) -> dict:
     if not config.MATTERPORT_TOKEN_ID or not config.MATTERPORT_TOKEN_SECRET:
         raise MatterportError("MATTERPORT_TOKEN_ID / MATTERPORT_TOKEN_SECRET are not set in .env")
     response = httpx.post(
         config.MATTERPORT_API_URL,
         json={"query": query, "variables": variables or {}},
         auth=(config.MATTERPORT_TOKEN_ID, config.MATTERPORT_TOKEN_SECRET),
-        timeout=60,
+        timeout=timeout,
     )
     response.raise_for_status()
     body = response.json()
@@ -74,16 +74,19 @@ def search_models(address: str) -> list[dict]:
     """Candidate models for an address as [{id, name, address}], in Matterport's rank order, de-duplicated."""
     found: dict[str, dict] = {}
     for query in _search_variants(address):
-        results = graphql(SEARCH_QUERY, {"q": query, "n": config.ADDRESS_SEARCH_PAGE_SIZE})["models"]["results"]
+        results = graphql(SEARCH_QUERY, {"q": query, "n": config.ADDRESS_SEARCH_PAGE_SIZE},
+                          timeout=config.ADDRESS_SEARCH_TIMEOUT_S)["models"]["results"]
         for result in results or []:
             model_address = (result.get("address") or {}).get("address") or result.get("name") or ""
             found.setdefault(result["id"], {"id": result["id"], "name": result["name"], "address": model_address})
     return list(found.values())
 
 
-def rank_matches(address: str, models: list[dict]) -> list[dict]:
-    """Models whose address is sufficiently similar (config.ADDRESS_MATCH_THRESHOLD), best first, each with
-    `score` and `exact` added. Ties keep the input order (local cache first, then Matterport's rank)."""
+def rank_matches(address: str, models: list[dict], threshold: float | None = None) -> list[dict]:
+    """Models whose address is sufficiently similar (`threshold`, default config.ADDRESS_MATCH_THRESHOLD), best
+    first, each with `score` and `exact` added. Ties keep the input order (local cache first, then Matterport's
+    rank). resolve.py passes the lower config.ADDRESS_CLARIFY_THRESHOLD to find models worth asking about."""
+    threshold = config.ADDRESS_MATCH_THRESHOLD if threshold is None else threshold
     scored = []
     for model in models:
         # Some models carry the address only in the name ("7921 Pointer St"), so the better of the two counts. The
@@ -93,7 +96,7 @@ def rank_matches(address: str, models: list[dict]) -> list[dict]:
         # beat the real Princeton model on the tie because it was cached.
         texts = [t for t in (model["address"], addresses.with_locality(model["name"], model["address"])) if t]
         score = max((addresses.similarity(address, t) for t in texts), default=0.0)
-        if score >= config.ADDRESS_MATCH_THRESHOLD:
+        if score >= threshold:
             scored.append({**model, "address": model["address"] or model["name"], "score": round(score, 3),
                            "exact": any(addresses.is_exact(address, t) for t in texts)})
     return sorted(scored, key=lambda m: -m["score"])

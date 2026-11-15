@@ -10,3 +10,8 @@ sentence-transformers==6.3.0   # local paraphrase matching of caller messages (s
 numpy==2.4.6
 pillow==13.0.0
 pytest==9.2.0
+usaddress==0.5.16   # trained US address parser for caller input (addresses.parse_caller)
+text2num==3.1.0   # spoken numbers to digits ("thirteen one twenty two")
+phonenumbers==9.0.43   # caller IDs to E.164 (phones.py)
+python-dotenv==1.2.3   # .env loading (config.py); last value wins, like Node's --env-file
+rapidfuzz==3.14.6   # optional faster string similarity (addresses.py)

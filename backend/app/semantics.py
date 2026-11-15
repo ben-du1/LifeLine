@@ -41,6 +41,11 @@ EXAMPLES = {
     "front_door": ["I can see the front door", "I'm by the entrance of the house"],
     "sliding_door": ["there's a sliding glass door", "a glass door to the backyard"],
     "narrow": ["a long narrow corridor", "a long thin passage", "it's long and skinny"],
+    # Not a location cue (followups ignores keys outside FEATURES): danger where the caller is, for paraphrases
+    # questions.mentions_danger misses ("it's getting really warm in here", "I see an orange glow under the door").
+    "danger": ["there is smoke coming in", "it's getting really hot in here", "the door feels hot",
+               "I see an orange glow under the door", "I smell something burning", "I can hear the fire",
+               "it's hard to breathe"],
 }
 # Messages that carry no location cue. A cue must beat the best of these by NEUTRAL_MARGIN, so "please help me"
 # never matches anything.

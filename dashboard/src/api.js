@@ -31,6 +31,9 @@ export const startCall = (phone, address, modelId = null) =>
   request("/api/calls", { method: "POST", body: JSON.stringify({ phone, address, model_id: modelId }) });
 export const sendReply = (sessionId, text) =>
   request(`/api/sessions/${sessionId}/reply`, { method: "POST", body: JSON.stringify({ text }) });
+// A text arriving at the line, as the messaging sidecar posts it (test tools only). Returns {ok, session, created}.
+export const sendInbound = (from, text) =>
+  request("/api/inbound", { method: "POST", body: JSON.stringify({ from, text }) });
 
 // Live session snapshots. Reconnects automatically because the backend may restart during development. While the
 // socket is down, the sessions are polled every 2 s instead, so the page never needs a reload to catch up.

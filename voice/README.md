@@ -7,7 +7,24 @@ CLIP evidence, Bayesian updates, floor checks, followups.choose, and in-room ref
 The same WebSocket broadcasts update the dispatcher dashboard.
 
 Voice sessions use channel="voice", so they do not send iMessages. They are bound to the
-ElevenLabs conversation ID, not the phone number. Repeated tool requests reuse the recorded
+ElevenLabs conversation ID, not the phone number.
+
+## Call flow
+
+1. The agent asks for the building address and calls start_location with it (house number in digits).
+   The backend sends it through the same call intake as a text (sessions.open_call): the address is
+   matched to a Matterport model, and the backend may answer "Did you mean ...?", "Is it ... or ...?",
+   or ask for the address once more. The agent relays the caller's answers with submit_location_answer.
+2. The caller ID comes from ElevenLabs' system__caller_id and is parsed by phones.to_e164 (US numbers
+   without +1, SIP URIs). A withheld number ("anonymous", "restricted", ...) gives an unknown caller
+   (phone None); the call still works, keyed by the conversation ID.
+3. Once the building is found, the room-locating conversation runs as before.
+4. Every tool response has an "ended" field. It is true when the caller was handed off because the
+   address is outside the service area (status "transferred"), when the caller is out, or when the
+   session has ended. The instruction is then "Say the text exactly, then end the call.", and the
+   agent speaks the text and uses end_call. The hand-off is recorded only; no call is transferred.
+5. The backend ends a voice interview after VOICE_INTERVIEW_SECONDS (config.py, 300 s), and gives up on
+   a building that takes longer than VOICE_LOADING_SECONDS (60 s) to load after the address is settled. Repeated tool requests reuse the recorded
 answer result; repeated "yes" answers on different transcript turns are processed separately.
 State is in memory, like existing sessions: run one backend worker and restart conversations
 after a backend restart. Full voice turns are serialized per conversation.
@@ -17,10 +34,12 @@ after a backend restart. Full voice turns are serialized per conversation.
 Use the gitignored **project-root .env** for Matterport, optional Claude, and ElevenLabs settings.
 It contains ELEVENLABS_API_KEY, ELEVENLABS_AGENT_ID, ELEVENLABS_VOICE_SECRET_ID,
 VOICE_TOOL_TOKEN, and VOICE_PUBLIC_URL. The backend, gateway, and setup helper read .env;
-.env.local is not used. Existing process environment variables take priority.
+.env.local is not used. Existing process environment variables take priority. If a name appears
+twice in .env, the last line wins (python-dotenv in the backend, --env-file in Node).
 Do not commit .env or paste its contents into chat.
 
-Provisioning saves generated voice identifiers and credentials into .env.
+Provisioning saves generated voice identifiers and credentials into .env, rewriting an existing
+NAME= line in place instead of appending a duplicate.
 Follow the main README's backend installation steps before running real room-location calls.
 
 ## Start the services
@@ -68,7 +87,7 @@ Quick Tunnels are intended for development; use a stable tunnel/deployment for a
 Use an eligible Photon SMS number or dedicated messaging line. Shared iMessage assignments
 cannot receive voice. Use your personal phone to call the Photon number.
 
-For an incoming-only demo:
+For incoming calls only:
 1. In Photon Voice, create/select the number's SIP profile. Set media encryption to Auto.
 2. In ElevenLabs Deploy > Phone Numbers > Import number > From SIP Trunk, enter the Photon number.
 3. Set inbound media encryption to Allowed. Outbound configuration can stay disabled;
@@ -84,9 +103,9 @@ DEV_TEST_PHONE only prefills the dashboard caller field. After changing it in .e
 restart the FastAPI backend and refresh the browser; leave the gateway and tunnel running.
 Restart both backend and gateway after changing VOICE_TOOL_TOKEN.
 
-The agent and its saved tool bindings have been verified, with eight Python checks and one
-gateway check passing. Live phone delivery and model inference were not verified by those
-checks. See AGENTS.md at the repo root for the full architecture, environment reference, and demo steps.
+**Re-run `npm run setup` after pulling the caller-initiated-calls change:** the agent prompt and
+tool descriptions changed (address digits, address answers through submit_location_answer, end_call
+after an ended response). The offline checks below do not cover live phone delivery or model inference. See the main README for the full architecture, environment reference, and run steps.
 
 ## Checks without live calls
 
@@ -97,8 +116,10 @@ cd ..\voice
 npm test
 ```
 
-Bridge tests use a fake session manager; pipeline tests use deterministic model outputs. They do not exercise live Matterport or model inference.
-The agent speaks demo wording and does not claim to have contacted emergency services.
+Bridge tests use a fake session manager; pipeline tests use deterministic model outputs;
+backend/tests/test_voice_e2e.py runs voice calls through the intake (unknown address, retry,
+out-of-area hand-off, "Did you mean", withheld caller ID). They do not exercise live Matterport or
+model inference. The agent does not claim that help is on the way.
 
 Sources:
 - https://photon.codes/docs/beta/cookbooks/voice/elevenlabs
@@ -106,4 +127,4 @@ Sources:
 - https://elevenlabs.io/docs/eleven-agents/customization/personalization/dynamic-variables
 - https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/
 
-Configure the ElevenLabs post-call transcription webhook at `/api/voice/post-call` on the voice gateway public URL. Set `ELEVENLABS_POST_CALL_SECRET` in the backend environment to the webhook signing secret, then restart the backend. Audio delivery is optional and should be left off for the demo.
+Configure the ElevenLabs post-call transcription webhook at `/api/voice/post-call` on the voice gateway public URL. Set `ELEVENLABS_POST_CALL_SECRET` in the backend environment to the webhook signing secret, then restart the backend. Audio delivery is optional; leave it off.

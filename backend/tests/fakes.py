@@ -43,7 +43,7 @@ if not hasattr(sys.modules["PIL"], "Image"):
     sys.modules["PIL.Image"] = _image
     sys.modules["PIL"].Image = _image
 
-from app import config, embeddings, ingest, llm, matterport, orientation, semantics  # noqa: E402
+from app import catalog, config, embeddings, ingest, layout, llm, matterport, orientation, semantics  # noqa: E402
 from app.building import Building  # noqa: E402
 from app.sessions import SessionManager  # noqa: E402
 
@@ -207,6 +207,10 @@ def install(monkeypatch, base: Path, specs: list[Spec]) -> None:
     monkeypatch.setattr(llm, "enabled", lambda: False)
     monkeypatch.setattr(config, "MESSAGING_MODE", "simulated")
     monkeypatch.setattr(orientation, "ensure", lambda model_id: None)
+    # Doors and windows (one Matterport GraphQL call per model) and the downloaded catalog: with a real .env and
+    # data/ on a laptop, both would otherwise reach Matterport or match real models against the synthetic ones.
+    monkeypatch.setattr(layout, "ensure", lambda model_id: None)
+    monkeypatch.setattr(catalog, "candidates", lambda address, limit=None: [])
     monkeypatch.setattr(matterport, "search_models",
                         lambda address: [{"id": s.model_id, "name": s.address, "address": s.address} for s in specs])
 

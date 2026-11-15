@@ -3,6 +3,8 @@
 import re
 from dataclasses import dataclass
 
+from . import config
+
 # Texts to the caller. The building may be on fire, so no message says "stay where you are" unconditionally: getting
 # out comes first, staying put is only for when they can't, and the caller is told to text if they move or get out
 # (handled by is_out and the correction/move check below). Each text is short and asks for one thing, because the
@@ -76,6 +78,8 @@ _NO = re.compile(
     _FILLER + r"((?:no+|n)(?=\s*$|\s*[,.!?;:-]|\s+(?:i|im|i'm|it|its|it's|there|theres|there's|nothing|none|not|"
     r"sorry|but|just|only|that|thats|that's|one|we|my|no+|nope)\b)|no+pe+|na+h+|nay|negative|not really|"
     r"not that i (?:can )?see|(?:i )?don'?t think so|"
+    # Emphatic denials start with a word _YES reads as yes ("absolutely"), so they must be matched here first.
+    r"(?:absolutely|definitely|certainly|of course|surely)\s+not|not at all|hell no|no way(?!\s+out)|"
     r"there (?:isn'?t|aren'?t)(?=\s*$|\s*[,.!?]|\s+(?:one|any|anything)\b)|"
     r"i (?:don'?t|can'?t|cannot) see(?=\s*$|\s*[,.!?]|\s+(?:one|it|any|anything|that|them)\b)|none)" + _AFTER,
     re.I)
@@ -111,29 +115,222 @@ _CORRECTION = re.compile(
     r"\b(actually|i meant|i mean|no wait|wait no|correction|scratch that|my mistake"
     r"|i('ve| have)? moved|we('ve| have)? moved|i'?m now|now i'?m)\b|^\s*sorry\b", re.I)
 
-# The caller has left the building: "OUT", "I'm out", "we got outside", "made it out of the house".
-_OUT = re.compile(
-    r"^\s*out\s*[.!]*\s*$"
-    r"|\b(i'?m|i am|we'?re|we are|got|made it|gotten)\s+(out|outside)\b(?!\s+of\b)"  # "out of breath / of the bedroom"
-    r"|\b(left|outside|out of) the (building|house|home|apartment)\b", re.I)
-# "I can't get out", "we're not out": a negation means they're still inside.
-_NOT_OUT = re.compile(r"\b(can'?t|cannot|couldn'?t|unable|not|no way|trying to)\b", re.I)
+# Whether the caller has left the building is read by out_signal (below).
 
 
 # The caller reports danger where they are. Not used for locating; it flags the call and triggers SAFETY_MESSAGE.
-_DANGER = re.compile(r"\b(smoke|smoky|fire|flames?|burning|can'?t breathe|hard to breathe|hot door|door is hot)\b", re.I)
+# Heat is a warning before smoke reaches the caller: a hot or warm door means fire on the other side, and an orange
+# glow under the door or through a window is flames.
+_DANGER = re.compile(
+    r"\b(smoke|smoky|fire|flames?|burning|can'?t breathe|hard to breathe|"
+    r"(?:hot|warm) door|door(?:knob| handle)? (?:is|feels|getting|is getting) (?:really |so |very )?(?:hot|warm)|"
+    r"(?:it'?s|its|it is|getting|so|really|very) (?:getting )?(?:really |so |very )?hot(?: in here)?|"
+    r"orange (?:light|glow)|glow(?:ing|s)?)\b", re.I)
+# Phrases that contain a danger word but are not danger. They are removed before _DANGER is checked, so
+# "no smoke, but the door is hot" still counts while "no smoke here" and "the fireplace" don't.
+_NOT_DANGER = re.compile(
+    r"\b(fire ?place|fire ?pit|fire ?(?:alarm|extinguisher|escape|truck|department|fighters?)|"
+    r"(?:no|not any|isn'?t any|there'?s no) (?:smoke|fire|flames?)|"
+    r"(?:isn'?t|is not|not|never) (?:really |very )?(?:hot|warm|glowing)|"
+    r"hot (?:tub|water|chocolate|sauce|plate)|glow[- ]in[- ]the[- ]dark|glow ?sticks?|night ?light)\b", re.I)
 
 
 def mentions_danger(text: str) -> bool:
-    return bool(_DANGER.search(text)) and not re.search(r"\b(fire ?place|fire ?pit|no (smoke|fire))\b", text, re.I)
+    return bool(_DANGER.search(_NOT_DANGER.sub(" ", text)))
 
 
 def is_correction(text: str) -> bool:
     return bool(_CORRECTION.search(text))
 
 
+# ---- caller-initiated calls (contract; owner: workstream C)
+# The caller made contact, so the first message asks for the building before anything else. It still leads with
+# getting out, for the same reason as OPENING_MESSAGE.
+ADDRESS_QUESTION = (
+    "911: If you can get out safely, get out now and text OUT. "
+    "If you can't, what is the address of the building you're in?"
+)
+ADDRESS_RETRY = "I couldn't find that address. Please send the house number, street name and city."
+ADDRESS_CONFIRM = "Did you mean {address}?"
+ADDRESS_CHOOSE = "Is it {a} or {b}?"
+OUT_OF_AREA_MESSAGE = (
+    "That address isn't in this system's service area. "
+    "I'm connecting you to standard emergency services now. Stay on the line."
+)
+# Asked when a message might mean the caller got out ("I'm outside", "almost out") but might not, because treating
+# it as out ends the questions for someone who may still be inside.
+OUT_CONFIRM = "Are you outside the building now? Yes or no."
+
+
+# Spoken versions for a voice call, keyed by the text constant. Only what is wrong on a phone call changes:
+# "text OUT" -> "say you're out", "texting" -> "on this call", "text us" / "send" -> "tell me". Constants that read
+# the same aloud (ADDRESS_CONFIRM, SAFETY_MESSAGE, ...) are not listed and pass through unchanged.
+VOICE_VERSIONS = {
+    OPENING_MESSAGE: (
+        "911: We're on this call to help responders find you inside the building. "
+        "If you can get out safely, get out now and say you're out. "
+        "If you can't, tell me what room you're in and what you can see around you."
+    ),
+    ADDRESS_QUESTION: (
+        "911: If you can get out safely, get out now and say you're out. "
+        "If you can't, what is the address of the building you're in?"
+    ),
+    ADDRESS_RETRY: "I couldn't find that address. Please tell me the house number, street name and city.",
+    LOCATED_MESSAGE: (
+        "Got it. Responders will look for you in the {room}. "
+        "If it becomes unsafe there, get out or move, then tell me where you are."
+    ),
+    BEST_GUESS_MESSAGE: (
+        "Thank you. Responders know roughly where you are. "
+        "If you move or get out, tell me. Keep your phone with you."
+    ),
+    REFINED_MESSAGE: "Thank you, that tells responders where to look. If you move or get out, tell me.",
+    NO_MODEL_MESSAGE: (
+        "Responders are on the way to your address. If you can get out safely, get out now. "
+        "If you can't, tell me the room and floor you're on."
+    ),
+    OUT_MESSAGE: (
+        "Good. Stay away from the building and go to the responders when they arrive. "
+        "If anyone is still inside, tell me where they are."
+    ),
+}
+
+
+def _template_pattern(template: str) -> re.Pattern:
+    """A regex that finds `template` in a sent message, with each {name} placeholder captured, so a message built by
+    formatting a constant (LOCATED_MESSAGE.format(room=...)) is still recognised."""
+    parts = re.split(r"\{(\w+)\}", template)
+    return re.compile("".join(re.escape(part) if i % 2 == 0 else f"(?P<{part}>.+?)" for i, part in enumerate(parts)))
+
+
+# Longest first, so a template is never replaced inside a longer one that contains it.
+_VOICE_PATTERNS = [(_template_pattern(text), voice, "{" in text)
+                   for text, voice in sorted(VOICE_VERSIONS.items(), key=lambda item: -len(item[0]))]
+
+
+def for_channel(text: str, channel: str) -> str:
+    """The message as it should be sent on `channel` ("messaging" or "voice"). On voice, every known constant in the
+    message (also one formatted with values, or joined with other text) becomes its spoken version; anything else
+    is unchanged."""
+    if channel != "voice":
+        return text
+    for pattern, voice, has_fields in _VOICE_PATTERNS:
+        if has_fields:
+            text = pattern.sub(lambda m, voice=voice: voice.format(**m.groupdict()), text)
+        else:
+            text = pattern.sub(lambda m, voice=voice: voice, text)
+    return text
+
+
+# out_signal. A trapped caller can easily write "I'm outside the bathroom door"; reading that as out would stop the
+# questions for someone still inside, so a place inside the building after out/outside is not out.
+_OUT_NEGATED = re.compile(
+    r"\b(can'?t|cannot|couldn'?t|unable|not|no way|trying to|try to|tried to|how (?:do|can) (?:i|we)|"
+    r"(?:get|help|let) (?:me|us)|need to|have to|want to|stuck|trapped)\b", re.I)
+# Hedges are removed before the negation check ("not sure if I'm out" is a hedge, not "not out").
+_OUT_HEDGE = re.compile(r"\b(i think|i guess|maybe|probably|almost|nearly|not sure(?: if)?|i'?m not sure(?: if)?|"
+                        r"kind of|kinda|sort of|i believe)\b", re.I)
+# Clearly outside the building.
+_OUT_CLEAR = re.compile(
+    r"^\s*(?:i'?m |we'?re |im |were )?(?:out|outside)(?: now| safe| safely)?\s*[.!]*\s*$"
+    r"|\b(?:left|outside(?: of)?|out of|got out of|made it out of) (?:the |my |our |this )?"
+    r"(?:building|house|home|apartment|apt|condo|complex|office building)\b"
+    r"|\b(?:out|outside) (?:now|safe|safely)\b|\b(?:safe|safely) (?:out|outside)\b"
+    r"|\b(?:on|across) the (?:street|sidewalk|lawn)\b|\bin the (?:front yard|back ?yard|yard|parking lot|street)\b",
+    re.I)
+# "out"/"outside" said of the caller: "I'm out", "we got outside", "made it out" (no subject: the caller's own). Only
+# a first-person subject counts: "my kids are outside, I'm in the bedroom" and "smoke is outside my window" come
+# from callers who are still inside.
+_OUT_SAID = re.compile(
+    r"(?:\b(?:i'm|im|i am|i was|we're|we are|we were|we|i)\s+(?:(?:got|made it|gotten|went|are|all)\s+)*"
+    r"|^\s*(?:all\s+)?(?:got|made it|gotten|went)\s+(?:all\s+)?)(?:out|outside)\b(?!\s+of\b)", re.I)
+# Someone or something else is out/outside ("the kids are outside", "power is out", "the lights went out"). Removed
+# before the checks, so "the kids are outside now" isn't read as the caller being out either.
+_OUT_THIRD = re.compile(
+    r"\b(?!(?:i|we)\b)\w+(?:\s+(?:is|are|was|were|went)|'s)\s+(?:all\s+)?(?:out|outside)(?:\s+(?:now|safe|safely))?\b",
+    re.I)
+# Somewhere inside the building, named right after out/outside: "outside the bathroom door", "out of my room".
+_INSIDE_PLACE = (r"(?:room|bathroom|bedroom|kitchen|closet|hall(?:way)?|corridor|office|stairs|stairwell|basement|"
+                 r"attic|garage|laundry|elevator|unit|apartment door|bath|den|study|lobby|"
+                 r"(?:bedroom |bathroom |kitchen |closet |back )?door)")
+_OUT_INSIDE = re.compile(
+    rf"\b(?:out|outside)(?:\s+of)?\s+(?:the |my |our |a |his |her |their |this |that )?(?:\w+\s+)?{_INSIDE_PLACE}\b",
+    re.I)
+# The way out the caller used or is at, which may or may not be outside: "out the window", "on the balcony".
+_OUT_UNCLEAR = re.compile(
+    r"\b(?:went|got|climbed|go|going|jumped) out (?:the |a |through the )?window\b"
+    r"|\b(?:on|onto) the (?:roof|balcony|fire escape|ledge|porch)\b", re.I)
+_FRONT_DOOR = re.compile(r"\b(?:out|outside)(?:\s+of)?\s+(?:the |our |my )?(?:front|main) (?:door|entrance)\b", re.I)
+
+
+def out_signal(text: str):
+    """How sure it is that the caller has left the building: "out" (act on it now), "maybe" (ask OUT_CONFIRM first)
+    or None (not about getting out, or still inside: "I can't get out", "I'm outside the bathroom door")."""
+    text = normalize(text)
+    hedged = bool(_OUT_HEDGE.search(text))
+    plain = _OUT_THIRD.sub(" ", _OUT_HEDGE.sub(" ", text))
+    if _OUT_NEGATED.search(plain):
+        return None
+    if _OUT_CLEAR.search(plain):
+        return "maybe" if hedged else "out"
+    if _FRONT_DOOR.search(plain):
+        return "maybe"   # the house's front door, or the apartment's door onto the hallway
+    if _OUT_INSIDE.search(plain):
+        return None
+    if _OUT_UNCLEAR.search(plain):
+        return "maybe"   # before _OUT_SAID: "I'm out on the balcony" is still on the building
+    if _OUT_SAID.search(plain):
+        return "maybe" if hedged else "out"
+    return None
+
+
+# looks_like_address. A regex, not addresses.parse_caller: that parser was being written in parallel (workstream A)
+# and can replace this at integration. A house number (digits, or spoken number words), then up to
+# config.ADDRESS_MAX_NAME_WORDS words of street name, then a street word.
+_NUMBER_WORDS = (r"(?:zero|oh|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|"
+                 r"fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|"
+                 r"ninety|hundred|thousand)")
+_HOUSE_NUMBER = rf"(?:\d{{1,6}}[a-z]?(?:-\d{{1,5}})?|{_NUMBER_WORDS}(?:[\s-]+{_NUMBER_WORDS})*)"
+# Street words that are also common words ("way", "park", "green", "run") are left out: "there's one way out" and
+# "three people in the green room" are not addresses.
+_STREET_WORD = (r"(?:street|st|avenue|ave|av|road|rd|drive|dr|lane|ln|boulevard|blvd|court|ct|place|pl|circle|"
+                r"cir|terrace|ter|parkway|pkwy|highway|hwy|trail|trl|plaza|plz|pike|crescent|cres|alley|aly|"
+                r"expressway|expy|freeway|fwy|turnpike|tpke)")
+# Words of a sentence, not of a street name, between a number and a street word ("2 rooms down the hall").
+_NOT_NAME_WORD = r"(?:in|on|at|the|a|an|my|our|by|near|of|to|and|or|is|are|was|people|rooms?|floors?|minutes?|me|us)"
+_ADDRESS = re.compile(
+    rf"\b{_HOUSE_NUMBER}\s+(?:(?!{_NOT_NAME_WORD}\b)[\w'.-]+\s+){{1,{config.ADDRESS_MAX_NAME_WORDS}}}?"
+    rf"{_STREET_WORD}\b\.?", re.I)
+# "Route 1", "Highway 27": the number comes after the street word.
+_NUMBERED_ROAD = re.compile(r"\b\d{1,6}\s+(?:route|rte|highway|hwy|state road|county road)\s+\d{1,4}\b", re.I)
+
+
+def looks_like_address(text: str) -> bool:
+    """True when the text reads like a street address: a house number (digits or spoken number words), then a
+    street name and a street word ("13122 Chipman Glen Dr", "thirty one twelve Houston Avenue")."""
+    text = normalize(text)
+    return bool(_ADDRESS.search(text) or _NUMBERED_ROAD.search(text))
+
+
+# clearly_not_address. Anything with a digit, a spoken number ("oh" aside: "oh god") or a street word might be an
+# address; so might a bare street name ("chipman glen"), so only a plea, a greeting or a question is ruled out.
+_ADDRESS_HINT = re.compile(rf"\d|\b{_NUMBER_WORDS}\b|\b{_STREET_WORD}\b", re.I)
+_NOT_ADDRESS_CUE = re.compile(r"\?|\b(?:help|hurry|please|hello|hi|hey|what|who|why|are you there)\b", re.I)
+
+
+def clearly_not_address(text: str) -> bool:
+    """True for a reply that can't be an address ("please hurry", "hello?", "there's smoke"): no number and no street
+    word, and a plea, greeting, question or danger. Such text is not looked up (resolve may search Matterport)."""
+    text = re.sub(r"\boh\b", " ", normalize(text), flags=re.I)
+    if _ADDRESS_HINT.search(text):
+        return False
+    return bool(_NOT_ADDRESS_CUE.search(text)) or mentions_danger(text) or parse_reply(text).kind != "free"
+
+
 def is_out(text: str) -> bool:
-    return bool(_OUT.search(text)) and not _NOT_OUT.search(text)
+    """True when the caller has clearly left the building (out_signal "out"). A "maybe" is not out here; callers
+    that can ask OUT_CONFIRM use out_signal."""
+    return out_signal(text) == "out"
 
 
 def parse_reply(text: str) -> Reply:

@@ -59,6 +59,14 @@ class VoiceBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.manager.handle_reply.await_count, 1)
         self.assertNotEqual((await self.bridge.status("c1"))["say"], "Are there shelves?")
 
+    async def test_cursor_replays_output_until_agent_acknowledges(self):
+        await self.bridge.start("c1", "1 Main St")
+        response = await self.bridge.reply("c1", history("I see a bed"), acknowledge=0)
+        self.assertEqual(response, await self.bridge.status("c1", acknowledge=0))
+        after = await self.bridge.status("c1", acknowledge=response["response_id"])
+        self.assertNotEqual(after["say"], response["say"])
+        self.assertEqual(self.manager.handle_reply.await_count, 1)
+
     async def test_conversations_do_not_share_state_and_older_turns_rejected(self):
         await self.bridge.start("c1", "1 Main St")
         with self.assertRaises(VoiceError):

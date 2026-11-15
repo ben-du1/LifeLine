@@ -21,6 +21,7 @@ class VoiceCall:
     session: "Session"
     delivered: int = 0
     offered: int = 0
+    expiry: asyncio.TimerHandle | None = None
     loading_deadline: float = field(default_factory=lambda: time.monotonic() + 60)
     replies: dict[int, tuple[str, dict]] = field(default_factory=dict)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -84,6 +85,10 @@ class VoiceBridge:
                     phone or f"voice:{conversation_id}", address, channel="voice")
                 call = VoiceCall(session)
                 self.calls[conversation_id] = call
+                loop = asyncio.get_running_loop()
+                def expire():
+                    asyncio.create_task(self.end(conversation_id, "Voice interview reached its time limit."))
+                call.expiry = loop.call_later(240, expire)
             elif call.session.address != address.strip():
                 raise VoiceError("This conversation already has a different building address.", 409)
         # A retry returns the opening again but never starts another session.
@@ -125,6 +130,8 @@ class VoiceBridge:
     async def end(self, conversation_id: str, reason: str) -> None:
         call = self.calls.get(conversation_id)
         if call is not None:
+            if call.expiry is not None:
+                call.expiry.cancel()
             await self.manager.end_call(call.session, reason)
 
     async def _result(self, call: VoiceCall, acknowledge: int | None = None) -> dict:
@@ -140,6 +147,8 @@ class VoiceBridge:
             await asyncio.wait_for(session.ready.wait(), timeout=self.wait_seconds)
         except TimeoutError:
             if time.monotonic() >= call.loading_deadline:
+                if call.expiry is not None:
+                    call.expiry.cancel()
                 await self.manager.end_call(session, "Voice interview timed out while loading the building.")
                 return {"session_id": session.id, "status": "error", "pending": False,
                         "say": "The building took too long to load.", "awaiting_answer": False}

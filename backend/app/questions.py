@@ -238,10 +238,17 @@ _OUT_CLEAR = re.compile(
     r"|\b(?:out|outside) (?:now|safe|safely)\b|\b(?:safe|safely) (?:out|outside)\b"
     r"|\b(?:on|across) the (?:street|sidewalk|lawn)\b|\bin the (?:front yard|back ?yard|yard|parking lot|street)\b",
     re.I)
-# "out"/"outside" said of the caller: "I'm out", "we got outside", "made it out".
+# "out"/"outside" said of the caller: "I'm out", "we got outside", "made it out" (no subject: the caller's own). Only
+# a first-person subject counts: "my kids are outside, I'm in the bedroom" and "smoke is outside my window" come
+# from callers who are still inside.
 _OUT_SAID = re.compile(
-    r"\b(?:i'?m|im|i am|we'?re|we are|got|made it|gotten|went|are|is|all)\s+(?:all\s+)?(?:out|outside)\b"
-    r"(?!\s+of\b)", re.I)
+    r"(?:\b(?:i'm|im|i am|i was|we're|we are|we were|we|i)\s+(?:(?:got|made it|gotten|went|are|all)\s+)*"
+    r"|^\s*(?:all\s+)?(?:got|made it|gotten|went)\s+(?:all\s+)?)(?:out|outside)\b(?!\s+of\b)", re.I)
+# Someone or something else is out/outside ("the kids are outside", "power is out", "the lights went out"). Removed
+# before the checks, so "the kids are outside now" isn't read as the caller being out either.
+_OUT_THIRD = re.compile(
+    r"\b(?!(?:i|we)\b)\w+(?:\s+(?:is|are|was|were|went)|'s)\s+(?:all\s+)?(?:out|outside)(?:\s+(?:now|safe|safely))?\b",
+    re.I)
 # Somewhere inside the building, named right after out/outside: "outside the bathroom door", "out of my room".
 _INSIDE_PLACE = (r"(?:room|bathroom|bedroom|kitchen|closet|hall(?:way)?|corridor|office|stairs|stairwell|basement|"
                  r"attic|garage|laundry|elevator|unit|apartment door|bath|den|study|lobby|"
@@ -261,7 +268,7 @@ def out_signal(text: str):
     or None (not about getting out, or still inside: "I can't get out", "I'm outside the bathroom door")."""
     text = normalize(text)
     hedged = bool(_OUT_HEDGE.search(text))
-    plain = _OUT_HEDGE.sub(" ", text)
+    plain = _OUT_THIRD.sub(" ", _OUT_HEDGE.sub(" ", text))
     if _OUT_NEGATED.search(plain):
         return None
     if _OUT_CLEAR.search(plain):
@@ -270,10 +277,10 @@ def out_signal(text: str):
         return "maybe"   # the house's front door, or the apartment's door onto the hallway
     if _OUT_INSIDE.search(plain):
         return None
+    if _OUT_UNCLEAR.search(plain):
+        return "maybe"   # before _OUT_SAID: "I'm out on the balcony" is still on the building
     if _OUT_SAID.search(plain):
         return "maybe" if hedged else "out"
-    if _OUT_UNCLEAR.search(plain):
-        return "maybe"
     return None
 
 
@@ -303,6 +310,21 @@ def looks_like_address(text: str) -> bool:
     street name and a street word ("13122 Chipman Glen Dr", "thirty one twelve Houston Avenue")."""
     text = normalize(text)
     return bool(_ADDRESS.search(text) or _NUMBERED_ROAD.search(text))
+
+
+# clearly_not_address. Anything with a digit, a spoken number ("oh" aside: "oh god") or a street word might be an
+# address; so might a bare street name ("chipman glen"), so only a plea, a greeting or a question is ruled out.
+_ADDRESS_HINT = re.compile(rf"\d|\b{_NUMBER_WORDS}\b|\b{_STREET_WORD}\b", re.I)
+_NOT_ADDRESS_CUE = re.compile(r"\?|\b(?:help|hurry|please|hello|hi|hey|what|who|why|are you there)\b", re.I)
+
+
+def clearly_not_address(text: str) -> bool:
+    """True for a reply that can't be an address ("please hurry", "hello?", "there's smoke"): no number and no street
+    word, and a plea, greeting, question or danger. Such text is not looked up (resolve may search Matterport)."""
+    text = re.sub(r"\boh\b", " ", normalize(text), flags=re.I)
+    if _ADDRESS_HINT.search(text):
+        return False
+    return bool(_NOT_ADDRESS_CUE.search(text)) or mentions_danger(text) or parse_reply(text).kind != "free"
 
 
 def is_out(text: str) -> bool:

@@ -216,6 +216,10 @@ ADDRESS_CLARIFY_MARGIN = 0.10
 # How many catalog rows (catalog.py, ~15,000 models) are scored per caller address after the street-word prefilter.
 # Scoring is ~50 us per row, so 60 keeps resolve() in single milliseconds on a laptop.
 ADDRESS_CATALOG_CANDIDATES = 60
+# Per-request timeout (seconds) for Matterport's address search (3 GraphQL calls per address). The default 60 s kept a
+# caller with no reply for minutes on bad venue Wi-Fi; a search that slow is treated as failed and the cache and
+# catalog are used instead. Model downloads (ingest) keep the 60 s default.
+ADDRESS_SEARCH_TIMEOUT_S = 6
 # ---- B: intake and handoff (sessions.py, handoff.py, main.py)
 # Wrong or unknown addresses the caller gets to correct before the call is handed to standard 911. One retry: a
 # trapped caller should not spend minutes spelling an address this system can't serve anyway.

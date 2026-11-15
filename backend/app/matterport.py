@@ -11,14 +11,14 @@ class MatterportError(RuntimeError):
     pass
 
 
-def graphql(query: str, variables: dict | None = None) -> dict:
+def graphql(query: str, variables: dict | None = None, timeout: float = 60) -> dict:
     if not config.MATTERPORT_TOKEN_ID or not config.MATTERPORT_TOKEN_SECRET:
         raise MatterportError("MATTERPORT_TOKEN_ID / MATTERPORT_TOKEN_SECRET are not set in .env")
     response = httpx.post(
         config.MATTERPORT_API_URL,
         json={"query": query, "variables": variables or {}},
         auth=(config.MATTERPORT_TOKEN_ID, config.MATTERPORT_TOKEN_SECRET),
-        timeout=60,
+        timeout=timeout,
     )
     response.raise_for_status()
     body = response.json()
@@ -74,7 +74,8 @@ def search_models(address: str) -> list[dict]:
     """Candidate models for an address as [{id, name, address}], in Matterport's rank order, de-duplicated."""
     found: dict[str, dict] = {}
     for query in _search_variants(address):
-        results = graphql(SEARCH_QUERY, {"q": query, "n": config.ADDRESS_SEARCH_PAGE_SIZE})["models"]["results"]
+        results = graphql(SEARCH_QUERY, {"q": query, "n": config.ADDRESS_SEARCH_PAGE_SIZE},
+                          timeout=config.ADDRESS_SEARCH_TIMEOUT_S)["models"]["results"]
         for result in results or []:
             model_address = (result.get("address") or {}).get("address") or result.get("name") or ""
             found.setdefault(result["id"], {"id": result["id"], "name": result["name"], "address": model_address})

@@ -12,8 +12,6 @@ import logging
 from dataclasses import dataclass, field
 from typing import Literal
 
-import httpx
-
 from . import addresses, catalog, config, matterport
 
 log = logging.getLogger(__name__)
@@ -56,7 +54,7 @@ def _local_models(address: str) -> list[dict]:
 def _with_search(address: str, models: list[dict]) -> list[dict]:
     try:
         models = models + matterport.search_models(address)
-    except (matterport.MatterportError, httpx.HTTPError) as exc:
+    except Exception as exc:  # also a captive portal's HTML page (ValueError from .json()): never fail the lookup
         log.warning("Matterport search failed, matching against cached buildings and the catalog only: %s", exc)
     return _unique(models)
 

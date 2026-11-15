@@ -186,6 +186,8 @@ class SessionManager:
                 matches = await asyncio.to_thread(find_matches, session.address)
             loaded, tried = None, []
             for match in matches[:config.ADDRESS_MATCH_ATTEMPTS]:
+                if self._finished(session):   # the caller texted OUT (or the call ended) while a model loaded
+                    return
                 session.model_id, session.match = match["id"], match
                 session.status_detail = f"Loading interior model: {match['address']}..."
                 await self.notify(session)
@@ -196,15 +198,18 @@ class SessionManager:
                     log.info("Skipping model %s: %s", match["id"], exc)
                     tried.append(match["address"])
             if loaded is None:
-                session.model_id = session.match = None
-                detail = "No Matterport property with a sufficiently similar address."
-                if tried:
-                    detail = f"Similar Matterport properties had no usable interior: {'; '.join(tried)}."
-                await self._transfer(session, detail)
+                async with session.lock:
+                    if self._finished(session):   # "OUT" while loading must not become "transferred"
+                        return
+                    session.model_id = session.match = None
+                    detail = "No Matterport property with a sufficiently similar address."
+                    if tried:
+                        detail = f"Similar Matterport properties had no usable interior: {'; '.join(tried)}."
+                    await self._transfer(session, detail)
                 return
 
             async with session.lock:
-                if session.ended or session.status in ("out", "transferred"):
+                if self._finished(session):
                     return
                 if session.requested_model:
                     actual = loaded.building.address
@@ -226,11 +231,17 @@ class SessionManager:
                     text, session.queued = " ".join(session.queued), []
                     await self._process(session, text)
         except Exception as exc:  # surface any failure on the dashboard instead of leaving the call stuck
-            session.status, session.status_detail = "error", f"{type(exc).__name__}: {exc}"
+            if not self._finished(session):
+                session.status, session.status_detail = "error", f"{type(exc).__name__}: {exc}"
             await self.notify(session)
 
         finally:
             session.ready.set()
+
+    @staticmethod
+    def _finished(session: Session) -> bool:
+        """Nothing more to load for: the call ended, the caller is out, or it went to standard 911."""
+        return session.ended or session.status in ("out", "transferred")
 
     async def _load_orientation(self, session: Session) -> None:
         """Fetch north and the street out front once per building (cached on disk), then tell the dashboard."""
@@ -274,6 +285,12 @@ class SessionManager:
             except Exception:
                 log.exception("Could not interpret caller reply")
                 session.messages.append({"role": "system", "text": "Could not process this reply. Please try again.", "ts": time.time()})
+                if session.status == "awaiting_address" and not session.ended:
+                    # A caller with no building yet must never be left without a reply: ask for the address again.
+                    try:
+                        await self._ask_address(session, session.address_prompt or questions.ADDRESS_QUESTION)
+                    except Exception:
+                        log.exception("Could not re-send the address question")
                 await self.notify(session)
 
     async def _handle_reply(self, session: Session, text: str) -> None:
@@ -284,6 +301,15 @@ class SessionManager:
         session.messages.append({"id": uuid.uuid4().hex, "role": "caller", "text": shown, "ts": time.time()})
         # A transferred call is with standard 911 now: its texts are recorded only (safety advice aside).
         signal = questions.out_signal(text) if session.status not in ("out", "transferred") else None
+        # Danger is read before "out": "I'm out, the house is on fire" must still flag the fire for the dispatcher.
+        if session.status != "out" and questions.mentions_danger(text):
+            # Smoke or fire where the caller is: the dispatcher sees it on the call, and the caller gets the smoke
+            # advice now instead of after being located (not when getting out: stay-low advice is for indoors).
+            session.danger = True
+            going_out = signal == "out" or (session.out_pending and questions.parse_reply(text).kind == "yes")
+            if not session.safety_sent and not going_out:
+                session.safety_sent = True
+                await self._say(session, questions.SAFETY_MESSAGE)
         if session.out_pending:
             # The answer to OUT_CONFIRM ("Are you outside the building now?").
             session.out_pending = False
@@ -294,23 +320,18 @@ class SessionManager:
             if reply.kind == "no" and not reply.extra:
                 if session.out_resume:
                     await self._say(session, session.out_resume)   # back to the question they were answering
+                elif session.status == "awaiting_address":
+                    await self._ask_address(session)   # "I think I'm outside" was the first text: nothing to resume
                 else:
                     await self.notify(session)
                 return
             if reply.kind == "no":
                 text = reply.extra   # "no, I'm in the bedroom": read the rest as usual
             signal = None
-        # "Out" and danger are checked first, even while the building is still loading: neither should wait.
+        # "Out" and danger (above) are checked first, even while the building is still loading: neither should wait.
         if signal == "out":
             await self._caller_out(session)
             return
-        if session.status != "out" and questions.mentions_danger(text):
-            # Smoke or fire where the caller is: the dispatcher sees it on the call, and the caller gets the smoke
-            # advice now instead of after being located.
-            session.danger = True
-            if not session.safety_sent:
-                session.safety_sent = True
-                await self._say(session, questions.SAFETY_MESSAGE)
         if signal == "maybe":
             # "I think I'm out", "we're by the mailbox": ask before stopping the room questions on a guess.
             session.out_resume, session.out_pending = session.last_said, True
@@ -381,6 +402,10 @@ class SessionManager:
             await self._try_address(session, text)
 
     async def _try_address(self, session: Session, text: str) -> None:
+        if not session.address_nudged and questions.clearly_not_address(text):
+            # Not looked up: resolve can search Matterport (seconds on bad Wi-Fi) while this call's lock is held.
+            await self._nudge_address(session)
+            return
         session.status_detail = "Looking up the caller's address..."
         await self.notify(session)
         found = await asyncio.to_thread(resolve.resolve, text, frozenset(session.rejected_models))
@@ -401,12 +426,15 @@ class SessionManager:
                                          f"{options[0]['address']} ({round(options[0]['score'] * 100)}% similar).")
             await self._ask_address(session, prompt)
         elif not questions.looks_like_address(text) and not session.address_nudged:
-            # "There's smoke, please hurry" isn't a wrong address: ask again without using up the retry.
-            session.address_nudged = True
-            session.status_detail = "Waiting for the caller's address."
-            await self._ask_address(session)
+            await self._nudge_address(session)
         else:
             await self._address_failed(session, f"No Matterport property matches “{found.cleaned}”.")
+
+    async def _nudge_address(self, session: Session) -> None:
+        # "There's smoke, please hurry" isn't a wrong address: ask again without using up the retry.
+        session.address_nudged = True
+        session.status_detail = "Waiting for the caller's address."
+        await self._ask_address(session)
 
     async def _address_answer(self, session: Session, text: str) -> None:
         """The answer to ADDRESS_CONFIRM ("Did you mean ...?") or ADDRESS_CHOOSE ("Is it A or B?")."""
@@ -426,6 +454,8 @@ class SessionManager:
             session.messages.append({"role": "system", "text": f"Caller confirmed the address: {options[pick]['address']}.",
                                      "ts": time.time()})
             await self._accept_address(session, options[pick], confirmed=True)
+            if reply.kind == "yes" and questions.has_detail(reply.extra):
+                session.queued.append(reply.extra)   # "yes, I'm in the bedroom": read once the building has loaded
             return
         if not rejected:
             # Neither yes nor no but another address ("no wait, it's 13120"): look that one up instead.

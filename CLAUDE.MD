@@ -7,7 +7,7 @@
 
 # Project context (for agents)
 
-HackPrinceton Fall 2026 MVP (CoStar × Matterport track, deadline Nov 15 2026, 4 PM EST). A 911 dispatcher enters a
+HackPrinceton Fall 2026 MVP (CoStar × Matterport track, Devpost hard stop Nov 15 2026, 8:00 AM ET). A 911 dispatcher enters a
 caller's phone and address. The system finds the building's Matterport digital twin, texts the caller (Photon
 iMessage, or a simulated caller box), asks follow-up questions, and puts a dot on the room the caller is in.
 **README.md is the full spec and status page:** read its "Status" table first, and keep it current when behaviour
@@ -31,7 +31,7 @@ changes.
   `.venv/Scripts/python` can fail ("No module named app" or exit 127). Use
   `/c/Users/ben/desktop/coding/hackprinecton-mvp/backend/.venv/Scripts/python` and `cd` into `backend/` in the same
   command.
-- **Tests:** `cd backend && .venv/Scripts/python -m pytest -q` (279 tests; `tests/fakes.py` runs the real SessionManager offline with a fake CLIP).
+- **Tests:** `cd backend && .venv/Scripts/python -m pytest -q` (about 490 tests; `tests/fakes.py` runs the real SessionManager offline with a fake CLIP).
 - **Eval:** `cd backend && MESSAGING_MODE=simulated .venv/Scripts/python scripts/eval_scenarios.py -v`. It is slow
   the first time, because it ingests 3 buildings.
 - **Backend:** `cd backend && .venv/Scripts/python -m uvicorn app.main:app --port 8000`.
@@ -66,6 +66,11 @@ changes.
   - **CoStar:** not used; its extract has no roads or imagery.
 - **Photon:** the project is on Photon Beta (`pho_prj_…`, `pho_sk_…`). The `spectrum-ts` SDK rejects Beta ids,
   hence plain REST. Replies come in by polling, so no webhook or tunnel is needed.
+- **Caller-initiated intake:** the caller texts or calls; `sessions.open_call` asks for the address
+  (`awaiting_address`), clarifies once, allows one retry, then hands off to standard 911 (`handoff.py`, a stub).
+  OUT and danger checks stay first. No "demo" wording in anything a caller sees.
+- **Caller addresses:** `usaddress` (trained US parser) after `text2num` and filler stripping
+  (`addresses.parse_caller`); bands in `resolve.py`. libpostal and the Census Geocoder are future work.
 - **Multi-floor:**
   - all floors are ingested;
   - the floor question comes first while no floor has 80%;

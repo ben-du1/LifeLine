@@ -1,9 +1,9 @@
 # HackPrinceton MVP: Locating Callers Inside Buildings
 
 Built for the CoStar × Matterport track ("Inside and Out: AI for the Built World") at HackPrinceton Fall 2026
-(Nov 13–15, 2026; submissions close **Nov 15, 4:00 PM EST**).
+(Nov 13–15, 2026; Devpost hard stop **Nov 15, 8:00 AM ET**). This is a hackathon build, not a real 911 system.
 
-## Status (2026-11-14)
+## Status (2026-11-15)
 
 | Area | State |
 |---|---|
@@ -19,6 +19,10 @@ Built for the CoStar × Matterport track ("Inside and Out: AI for the Built Worl
 | Demo preflight (`scripts/preflight_demo.py`) + "Demo buildings" menu (`/api/demo`) | Written; unit-tested on a synthetic cache and dry-run with stubs. **Not yet run against the live API** |
 | Vexcel aerial overlay | Tried and removed (see "Orientation"). CoStar data: not used. |
 | Map view data: GeoJSON rooms + Vexcel aerial photo (`geo.py`) | Written and tested with mocked Matterport/Vexcel; **never run live** |
+| Caller-initiated calls, text (caller texts the line → address question → room questions) | **Verified offline only**: `tests/test_e2e_flow.py` drives the FastAPI app with the offline harness; not yet run through Photon |
+| Caller-initiated calls, voice (`VoiceBridge` → `open_call`) | Tested offline; **not live-tested** (needs `npm run setup` for the new agent prompt) |
+| Caller address matching (`usaddress`, clarify bands, `resolve.py`) | Unit-tested on messy inputs (spoken numbers, filler, typos, swapped digits) |
+| Out-of-area handoff (`handoff.py`) | **Stub**: records the transfer and tells the caller; connects nothing |
 
 ## Problem
 
@@ -29,8 +33,11 @@ text conversation with the caller.
 
 ## How it works
 
-1. **911 call comes in.** The caller's phone number and address are forwarded to our program. For this MVP they are
-   entered on the dispatcher dashboard (simulated 911 input).
+1. **The caller texts or calls the line.** The number comes from the channel (iMessage sender, or caller ID for
+   voice). The first message tells them to get out and text OUT if they can, and otherwise asks for the building's
+   address. The address is matched to a Matterport model (see "Address matching"): a close but inexact match is
+   confirmed once ("Did you mean ...?"), and an address outside coverage gets one retry, then a handoff to standard
+   911 (a stub in this build).
 2. **Two things start in parallel:**
    - The program texts the caller over iMessage (via Photon) and asks them to describe the room they are in.
    - The address is matched to the Matterport digital twin whose address is most similar. The match does not have
@@ -67,8 +74,8 @@ text conversation with the caller.
 - Fire or smoke conditions (low visibility, panic-affected descriptions).
 - Basements: Matterport floor labels are just "Floor 1", "Floor 2", ..., so the lowest floor is treated as the
   ground floor.
-- Addresses with no Matterport model: the session is marked "no interior model" and no location is attempted.
-- Real 911 integration (call data is typed into the dashboard).
+- Addresses with no Matterport model: the call is handed off to standard 911 (a stub) and no location is attempted.
+- Real 911 integration: calls start when the caller texts or calls our line, not from a 911 center.
 - CoStar data (not used: the extract is property, lease and sale records, with no roads or imagery). Vexcel aerial
   imagery was integrated, then removed (see "Orientation").
 
@@ -93,7 +100,7 @@ text conversation with the caller.
 |------------|--------------|-----------------------------------|----------------|
 | Backend    | `backend/`   | Python 3.11, FastAPI, open_clip   | Sessions, building ingest, matching, question choice, REST + WebSocket API |
 | Messaging  | `messaging/` | Node 20+, `fetch` (Photon REST)   | Sends iMessages for the backend; forwards caller replies to the backend |
-| Dashboard  | `dashboard/` | React + Vite                      | Simulated 911 form, live conversation, room probabilities, floor plan with dot |
+| Dashboard  | `dashboard/` | React + Vite                      | Responder screen: incoming calls, where to go, read-only conversation, floor plan with dot; test tools behind `?test=1` |
 | Cache      | `data/`      | Files on disk (gitignored)        | Building JSON, skybox images, floorplan image, embeddings |
 
 Sessions are kept in memory in the backend (restarting the backend clears them). Buildings are cached on disk.
@@ -134,7 +141,7 @@ Sessions are kept in memory in the backend (restarting the backend clears them).
 | GET    | `/api/sessions/{id}`           | One session snapshot |
 | GET    | `/api/sessions/{id}/rooms`     | Every room of the call's building, most likely first: `{index, name, types, floor, area_m2, probability, sweeps[{candidate, x, y, probability, views[url]}]}` |
 | POST   | `/api/sessions/{id}/reply`     | `{text}`: simulated caller reply from the dashboard |
-| POST   | `/api/inbound`                 | `{from, text}`: real caller reply, posted by the messaging sidecar |
+| POST   | `/api/inbound`                 | `{from, text, event_id?}`: a caller text, posted by the messaging sidecar. Continues the sender's open text call, or opens a new one (none, ended, or quiet for `SESSION_REUSE_MINUTES`); returns `{ok, session: <id>, created}`. **Unauthenticated**: keep the backend on localhost, off the tunnel (the tunnel exposes only the voice gateway) |
 | WS     | `/ws`                          | Pushes `{type: "session", session}` on every change |
 | GET    | `/api/buildings/{model_id}`    | Cached `building.json` (`floors`, `floorplans` per floor, rooms with `floor`/walls/polygon/centroid, candidates) with asset URLs, plus `orientation` (`yaw_deg`, `street{name, distance_m, bearing_deg, side, direction_deg}`) once fetched |
 | GET    | `/api/buildings/{model_id}/geo`    | GeoJSON `FeatureCollection` of rooms (`properties{kind:"room", index, name, floor, types}`) and the building outline (`kind:"building"`), plus `center{lat, lon}`, `yaw_deg`, `candidates[{candidate, lat, lon, room, floor}]`, `bounds[[s, w], [n, e]]`. 404 if not loaded or no geolocation |
@@ -151,7 +158,12 @@ runner_up_probability, confident}`, and `tie_group[{index, name, probability}]` 
 from the leading one, leader first; empty when there is no tie, see `ties.py`),
 `evidence[{ts, text, top_before, changes[{name, delta}]}]` (last 20
 caller messages: the top-3 room probability changes each caused, shown under the message on the dashboard).
-Statuses: `loading → listening → located | best_guess`, or `no_model` / `error`.
+Also `phone` (E.164, or null when unknown or withheld), `channel` (`messaging` or `voice`), `danger`, and
+`transfer` (null, or `{reason, ts, target, stub: true}` after an out-of-area handoff).
+Statuses: `awaiting_address → loading → listening → located | best_guess`; `awaiting_address → transferred` when
+the address is outside coverage; `out` when the caller says they got out; `error`. Calls started with an address
+(`/api/calls`) skip `awaiting_address`. `no_model` is no longer produced (an address with no usable model is
+handed off).
 
 ## Matterport data
 
@@ -220,7 +232,7 @@ model at a very similar address does exist. The backend therefore picks the mode
 3. **Accept:**
    - The best model scoring at least `ADDRESS_MATCH_THRESHOLD = 0.80` is used. If it has no usable interior, up to
      `ADDRESS_MATCH_ATTEMPTS = 3` matches are tried in order.
-   - Below the threshold the call ends as `no_model`.
+   - Below the threshold a dispatcher-started call (`/api/calls`) is handed off as `transferred`.
    - A non-exact match is shown on the dashboard (orange note under the address, plus a system message with the
      similarity) so the dispatcher can confirm it with the caller.
 
@@ -232,6 +244,23 @@ model at a very similar address does exist. The backend therefore picks the mode
 | `302 West Drew, Houston` | 302 W Drew St, Houston (exact) | 1.00 |
 | `233 W 27th St, Houston` | none (best was 233 W 26th St) | < 0.80 |
 | `1600 Pennsylvania Ave NW, Washington DC` | none | < 0.80 |
+
+### Caller addresses (`resolve.py`, `addresses.parse_caller`)
+
+A caller's address is messier than a dispatcher's ("um it's thirteen one twenty two chipman glen in houston").
+`parse_caller` turns spoken numbers into digits (`text2num`), joins grouped house numbers ("13 1 22" → 13122),
+drops filler before the first digit, and tags the parts with `usaddress` (a trained US parser), falling back to the
+hand-written parser. Candidates are the cache, the downloaded model catalog (`catalog.py`) and, only without an
+exact local match, Matterport's search. `resolve()` then picks a band:
+
+| Band | Rule | Caller hears |
+|---|---|---|
+| match | exact house number and street, score ≥ 0.80 | the opening message; the building loads |
+| clarify | one model ≥ `ADDRESS_CLARIFY_THRESHOLD` (0.65), at least `ADDRESS_CLARIFY_MARGIN` (0.10) ahead | "Did you mean <address>?" |
+| choose | two models within 0.10 (neighbouring houses, units) | "Is it <a> or <b>?" |
+| none | nothing ≥ 0.65 | the address question again (`ADDRESS_RETRIES = 1`), then the out-of-area handoff |
+
+A rejected suggestion is excluded from the next lookup. Not done: standardizing with a geocoder (see "Future work").
 
 ## Matching approach (`locator.py`)
 
@@ -521,7 +550,7 @@ cd dashboard && npm install && npm run dev        # http://localhost:5173
 cd messaging && npm start                         # no dependencies; the caller's phone must text the shared line first
 ```
 
-Tests: `cd backend && .venv/Scripts/python -m pytest` (279 tests). `test_semantics.py` downloads the ~90 MB
+Tests: `cd backend && .venv/Scripts/python -m pytest` (about 490 tests). `test_semantics.py` downloads the ~90 MB
 paraphrase model on first run; the rest need no network.
 Scenario check: `cd backend && .venv/Scripts/python scripts/eval_scenarios.py [-v]` (ingests the three test
 buildings on first run).
@@ -537,7 +566,10 @@ buildings on first run).
    call. Add a building by appending `{address, label, model_id, note, self_test, expect_room}` to the JSON file.
    On the dashboard, the **Demo buildings** menu above the address fills it in (✓ cached, ⚠ not cached; a
    not-cached choice warns that the first call will take a few minutes to load).
-1. Open the dashboard and enter a phone number and `13122 Chipman Glen Dr, Houston, TX`.
+1. Text the line (or call it) from the caller's phone, e.g. "help". The reply asks for the address; send
+   `13122 Chipman Glen Dr, Houston, TX`. The call appears on the dashboard by itself. Without a phone, open the
+   dashboard with `?test=1` and use "Simulate incoming text". An address outside coverage (any street not in
+   Matterport) shows the retry and then the handoff to standard 911.
 2. As the caller (simulated box, or a real phone in `photon` mode), describe the room. The sample house is empty,
    so describe fixtures: "there's a brick fireplace and a big window" (living area) or "I can see a stove and a
    fridge" (kitchen).
@@ -564,6 +596,18 @@ buildings on first run).
 - `LOGIT_SCALE` and the confidence values in `config.py` were hand-tuned on the sample model, not calibrated.
 - Sessions live in memory; restarting the backend clears them.
 - Photon's shared iMessage line can't start a conversation: a caller must text it first (see Messaging).
+- The out-of-area handoff is a stub: it records what would happen and connects nobody.
+- `/api/inbound` has no authentication; anyone who can reach the backend can open a call.
+
+## Future work
+
+- Census Geocoder (free, no key) to standardize caller addresses and break ties by location; libpostal if non-US
+  addresses matter.
+- `shapely` for the hand-written geometry (polygon chaining, point-in-polygon, shared walls, hull).
+- Calibrating the hand-tuned CLIP and confidence constants on a labelled set.
+- The Claude reader live (built, never run; adds 1 to 3 s per turn).
+- A real handoff to emergency services (voice: call transfer or carrier routing to the local 911 center; text:
+  Text-to-911); authentication on `/api/inbound`; Photon webhooks instead of polling.
 
 ## Voice demo
 

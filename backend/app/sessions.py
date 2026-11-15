@@ -157,6 +157,9 @@ class SessionManager:
             session.handle = phone.strip()   # iMessage from an email address: reply to (and match on) the handle
         # Nothing is loading: voice can answer at once. _start_loading clears this while a building loads.
         session.ready.set()
+        # Voice: the agent already asked for the address (start_location), so its text is read as one even when it
+        # doesn't look like an address ("Chipman Glen Drive, Houston" with no number can still be clarified).
+        session.address_asked = channel == "voice" and bool(first_text and first_text.strip())
         self.sessions[session.id] = session   # before any await, so a second text from this number finds it
         if first_text and first_text.strip():
             await self.handle_reply(session, first_text, event_id=event_id)

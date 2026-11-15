@@ -151,7 +151,7 @@ def test_non_address_reply_is_asked_again_without_using_the_retry(sent):
 def test_clarify_yes_loads_the_suggestion(sent):
     async def run():
         m = manager()
-        s = await m.open_call(PHONE, "messaging", "13122 Chipmen Glen")
+        s = await m.open_call(PHONE, "messaging", "13122 Chipmen Glen Dr")
         assert s.status == "awaiting_address" and s.waiting_for_match
         assert dispatched(s)[-1] == questions.ADDRESS_CONFIRM.format(address=HOUSE.address)
         await m.handle_reply(s, "yes")
@@ -164,7 +164,7 @@ def test_clarify_yes_loads_the_suggestion(sent):
 def test_clarify_no_asks_again_and_two_rejections_hand_off(sent):
     async def run():
         m = manager()
-        s = await m.open_call(PHONE, "messaging", "13122 Chipmen Glen")
+        s = await m.open_call(PHONE, "messaging", "13122 Chipmen Glen Dr")
         await m.handle_reply(s, "no")
         assert s.status == "awaiting_address" and HOUSE.model_id in s.rejected_models
         assert dispatched(s)[-1] == questions.ADDRESS_RETRY
@@ -178,7 +178,7 @@ def test_clarify_no_asks_again_and_two_rejections_hand_off(sent):
 def test_unclear_answer_to_a_suggestion_is_asked_once_more(sent):
     async def run():
         m = manager()
-        s = await m.open_call(PHONE, "messaging", "13122 Chipmen Glen")
+        s = await m.open_call(PHONE, "messaging", "13122 Chipmen Glen Dr")
         await m.handle_reply(s, "what?")
         assert s.waiting_for_match
         assert dispatched(s)[-1] == f"{questions.NOT_UNDERSTOOD} {questions.ADDRESS_CONFIRM.format(address=HOUSE.address)}"
@@ -193,7 +193,7 @@ def test_unclear_answer_to_a_suggestion_is_asked_once_more(sent):
 def test_choose_picks_one_of_two(sent, answer, chosen):
     async def run():
         m = manager()
-        s = await m.open_call(PHONE, "messaging", "both 1312 chipman")
+        s = await m.open_call(PHONE, "messaging", "both 1312 chipman dr")
         assert dispatched(s)[-1] == questions.ADDRESS_CHOOSE.format(a=HOUSE.address, b=NEIGHBOUR.address)
         await m.handle_reply(s, answer)
         await settle(s)
@@ -204,7 +204,7 @@ def test_choose_picks_one_of_two(sent, answer, chosen):
 def test_choose_neither_asks_again(sent):
     async def run():
         m = manager()
-        s = await m.open_call(PHONE, "messaging", "both 1312 chipman")
+        s = await m.open_call(PHONE, "messaging", "both 1312 chipman dr")
         await m.handle_reply(s, "neither")
         assert s.status == "awaiting_address" and dispatched(s)[-1] == questions.ADDRESS_RETRY
         assert s.rejected_models == {HOUSE.model_id, NEIGHBOUR.model_id}
@@ -349,7 +349,8 @@ def test_voice_rejecting_the_loaded_building_asks_for_the_address(sent, monkeypa
         assert s.waiting_for_match
         await m.handle_reply(s, "no")
         assert s.status == "awaiting_address" and s.model_id is None and s.posterior is None
-        assert HOUSE.model_id in s.rejected_models and dispatched(s)[-1] == questions.ADDRESS_RETRY
+        assert HOUSE.model_id in s.rejected_models
+        assert dispatched(s)[-1] == questions.for_channel(questions.ADDRESS_RETRY, "voice")
         await m.handle_reply(s, "13122 Chipman Glen Dr")   # excluded now, so it doesn't resolve
         assert s.status == "transferred"
     asyncio.run(run())

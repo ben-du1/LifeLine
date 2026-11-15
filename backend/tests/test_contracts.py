@@ -1,4 +1,4 @@
-"""Shape of the caller-initiated-call contracts (Phase 0). Workstreams replace the stubs; these must keep passing."""
+"""Shape of the caller-initiated-call contracts (Phase 0): names and shapes the workstreams agreed on."""
 
 import asyncio
 
@@ -9,7 +9,10 @@ from app import handoff, phones, questions, resolve, sessions
 
 
 def test_resolution_shape(monkeypatch):
-    monkeypatch.setattr(resolve, "find_matches", lambda text: [])
+    # resolve's real inputs, emptied: no cached buildings, no catalog rows, and no Matterport search (network).
+    monkeypatch.setattr(resolve, "cached_models", lambda: [])
+    monkeypatch.setattr(resolve.catalog, "candidates", lambda text: [])
+    monkeypatch.setattr(resolve.matterport, "search_models", lambda text: [])
     r = resolve.resolve("1 Nowhere Rd")
     assert r.band == "none" and r.candidates == [] and r.cleaned == "1 Nowhere Rd" and r.distinguishing == []
 

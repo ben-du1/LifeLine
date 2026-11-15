@@ -86,14 +86,11 @@ class VoiceBridge:
 
     async def _open(self, address: str, phone: str | None) -> "Session":
         """Send the address through the call intake (sessions.open_call: resolve, retry, "Did you mean", hand-off).
-        Managers without a working open_call (before workstream B is merged, and the fakes in test_voice_bridge.py)
-        get the older direct start_call."""
+        Managers without open_call (the fakes in test_voice_bridge.py and test_voice_routes.py) get the older direct
+        start_call."""
         open_call = getattr(self.manager, "open_call", None)
         if open_call is not None:
-            try:
-                return await open_call(phone, "voice", address)
-            except NotImplementedError:
-                pass
+            return await open_call(phone, "voice", address)
         return await self.manager.start_call(phone or "", address, channel="voice")
 
     async def start(self, conversation_id: str, address: str, phone: str | None = None) -> dict:

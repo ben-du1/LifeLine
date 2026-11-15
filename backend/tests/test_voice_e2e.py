@@ -2,8 +2,7 @@
 back as text to speak, and an address outside the coverage ends the call. Offline (tests/fakes.py, simulated
 messaging, no ElevenLabs).
 
-Tests marked xfail need workstream B's open_call; the integrator removes the marks in Phase 2. The rest use a small
-fake manager and pass now.
+Most tests run the real SessionManager; a few use a small fake manager.
 """
 
 import asyncio
@@ -18,8 +17,6 @@ import pytest
 import fakes
 from app import config, questions, resolve, sessions
 from app.voice import END_INSTRUCTION, INTAKE_INSTRUCTION, VoiceBridge, VoiceError
-
-NEEDS_B = pytest.mark.xfail(strict=False, reason="needs workstream B intake")
 
 ADDRESS = "13122 Chipman Glen Dr, Houston, TX"
 BUILDING = fakes.Spec("voice-e2e", ADDRESS, [
@@ -76,7 +73,6 @@ def fake_resolution(monkeypatch, bands: dict[str, str]):
 # ---- with workstream B's intake (sessions.open_call) -----------------------------------------------------------
 
 
-@NEEDS_B
 @run
 async def test_unknown_address_retries_once_then_ends_with_out_of_area(real, monkeypatch):
     manager, bridge = real
@@ -96,7 +92,6 @@ async def test_unknown_address_retries_once_then_ends_with_out_of_area(real, mon
     assert (await bridge.status("c1"))["ended"] is True
 
 
-@NEEDS_B
 @run
 async def test_clarify_over_voice_then_yes_loads_the_building(real, monkeypatch):
     manager, bridge = real
@@ -111,7 +106,6 @@ async def test_clarify_over_voice_then_yes_loads_the_building(real, monkeypatch)
     assert not second["ended"]
 
 
-@NEEDS_B
 @run
 async def test_intake_session_is_voice_and_keyed_by_conversation(real, monkeypatch):
     manager, bridge = real
@@ -125,7 +119,6 @@ async def test_intake_session_is_voice_and_keyed_by_conversation(real, monkeypat
     assert one.status == "listening"
 
 
-@NEEDS_B
 @run
 async def test_voice_messages_are_worded_for_speech(real, monkeypatch):
     manager, bridge = real
@@ -230,8 +223,7 @@ async def test_out_ends_the_call():
 async def test_manager_without_intake_falls_back_to_start_call():
     session = SimpleNamespace(id="s", address="1 Main St", status="loading", pending=None, ended=False,
                               ready=asyncio.Event(), messages=[{"role": "dispatch", "text": "Describe the room."}])
-    manager = SimpleNamespace(open_call=AsyncMock(side_effect=NotImplementedError), start_call=AsyncMock(
-        return_value=session))
+    manager = SimpleNamespace(start_call=AsyncMock(return_value=session))
     result = await VoiceBridge(manager).start("c1", "1 Main St", "anonymous")
     manager.start_call.assert_awaited_once_with("", "1 Main St", channel="voice")
     assert result["say"] == "Describe the room." and result["ended"] is False

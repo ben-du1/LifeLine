@@ -268,7 +268,7 @@ function InboundForm({ defaultPhone, onSession }) {
           const result = await sendInbound(phone, text);
           onSession(result.session, null);
         } catch (err) {
-          setError(err.message); // e.g. "No session for this phone number" until unknown numbers open calls
+          setError(err.message);
         } finally {
           setBusy(false);
         }

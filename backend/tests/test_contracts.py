@@ -42,7 +42,6 @@ def test_snapshot_has_new_fields():
     assert snap["transfer"] is None and snap["phone"] is None and "channel" in snap
 
 
-@pytest.mark.xfail(reason="open_call is implemented by workstream B", strict=False)
 def test_open_call_exists():
     manager = sessions.SessionManager(notify=lambda s: asyncio.sleep(0))
     s = asyncio.run(manager.open_call("+15555550100", "messaging"))

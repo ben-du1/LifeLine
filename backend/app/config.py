@@ -217,6 +217,12 @@ ADDRESS_CLARIFY_MARGIN = 0.10
 # Scoring is ~50 us per row, so 60 keeps resolve() in single milliseconds on a laptop.
 ADDRESS_CATALOG_CANDIDATES = 60
 # ---- B: intake and handoff (sessions.py, handoff.py, main.py)
+# Wrong or unknown addresses the caller gets to correct before the call is handed to standard 911. One retry: a
+# trapped caller should not spend minutes spelling an address this system can't serve anyway.
+ADDRESS_RETRIES = 1
+# A text from a number whose last call went quiet this long ago starts a new call instead of continuing the old one
+# (minutes since that call's last message).
+SESSION_REUSE_MINUTES = 30
 # ---- C: caller language (questions.py, semantics.py)
 # questions.looks_like_address: how many words a street name may have between the house number and the street
 # word ("13122 Chipman Glen Dr" is 2). Larger accepts longer names but also more sentences that merely contain a

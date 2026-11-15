@@ -1,8 +1,9 @@
 """Call sessions: building lookup/loading, the question loop, and snapshots for the dashboard.
 
-Status flow:  awaiting_address -> loading (caller-initiated calls) | transferred (address outside coverage)
+Status flow:  awaiting_address -> loading (caller-initiated calls, open_call) | transferred (address outside coverage)
               loading -> listening -> located | best_guess
-              loading -> no_model | error
+              loading -> transferred (no usable model for the address) | error
+              listening -> awaiting_address (voice: the caller says the suggested building is wrong)
               any -> out, when the caller texts that they got out of the building
 Replies that arrive while the building is still loading are queued and processed once it is ready.
 """
@@ -10,6 +11,7 @@ Replies that arrive while the building is still loading are queued and processed
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -17,6 +19,11 @@ from typing import Awaitable, Callable
 
 import httpx
 import numpy as np
+
+try:   # spoken house numbers ("thirteen one twenty two") when picking between two suggested addresses
+    from text_to_num import alpha2digit
+except ImportError:  # pragma: no cover
+    alpha2digit = None
 
 from . import (config, embeddings, followups, ingest, layout, llm, locator, matterport, messaging, orientation,
                questions, semantics)
@@ -48,7 +55,7 @@ class Evidence:
 @dataclass
 class Session:
     id: str
-    phone: str
+    phone: str | None          # E.164 for caller-initiated calls; None when the caller's number is unknown
     address: str
     created: float
     channel: str = "messaging"
@@ -88,6 +95,18 @@ class Session:
     rejected_models: set[str] = field(default_factory=set)       # models the caller said "no" to
     out_pending: bool = False                                    # asked OUT_CONFIRM, waiting for yes/no
     transfer: dict | None = None                                 # handoff.transfer_to_emergency_services record
+    address_asked: bool = False             # ADDRESS_QUESTION was sent (texts before it may be greetings, not addresses)
+    address_nudged: bool = False            # one non-address reply re-asked the question without using up a retry
+    address_options: list[dict] = field(default_factory=list)   # suggested models awaiting "yes"/"which one"
+    address_distinguishing: list[str] = field(default_factory=list)  # Resolution.distinguishing for address_options
+    address_heard: str = ""                 # the caller's address as cleaned by resolve (until a model is accepted)
+    address_prompt: str = ""                # the last address question, re-sent when an answer can't be read
+    address_reasked: bool = False           # that re-send happened for the current suggestion
+    address_confirmed: bool = False         # the caller confirmed a non-exact suggestion: don't ask again after loading
+    load_candidates: list[dict] | None = None   # models _load tries (from resolve); None: find_matches(address)
+    last_said: str = ""                     # last question or instruction sent (before for_channel)
+    handle: str | None = None               # sender handle when it isn't a phone number (iMessage email address)
+    out_resume: str = ""                    # last_said when OUT_CONFIRM went out: re-sent if the caller says "no"
 
 
 def _odds(p: float) -> float:
@@ -117,23 +136,47 @@ class SessionManager:
     # ---- call lifecycle -------------------------------------------------------------------------------------
 
     async def start_call(self, phone: str, address: str, model_id: str | None = None, *, channel: str = "messaging") -> Session:
+        """A call whose address is already known (the test drawer, preflight/eval scripts, voice start_location)."""
         session = Session(id=uuid.uuid4().hex[:8], phone=phone.strip(), address=address.strip(), created=time.time())
         session.channel = channel
         session.requested_model = model_id
         self.sessions[session.id] = session
         # Texting the caller and loading the building happen in parallel (README step 2).
         await self._say(session, questions.OPENING_MESSAGE)
-        asyncio.create_task(self._load(session))
+        self._start_loading(session)
         return session
 
-    async def open_call(self, phone: str | None, channel: str, first_text: str | None = None) -> Session:
+    async def open_call(self, phone: str | None, channel: str, first_text: str | None = None, *,
+                        event_id: str | None = None) -> Session:
         """A call the caller started (a text or a phone call) with no address yet: status "awaiting_address", ask for
-        the address (or use `first_text` if it already is one). Contract; workstream B implements it."""
-        raise NotImplementedError("open_call is implemented by workstream B")
+        the address, or read `first_text` first (an address skips the question; "OUT" never gets it)."""
+        session = Session(id=uuid.uuid4().hex[:8], phone=phones.to_e164(phone), address="", created=time.time(),
+                          channel=channel, status="awaiting_address",
+                          status_detail="Waiting for the caller's address.")
+        if session.phone is None and channel != "voice" and phone and phone.strip():
+            session.handle = phone.strip()   # iMessage from an email address: reply to (and match on) the handle
+        # Nothing is loading: voice can answer at once. _start_loading clears this while a building loads.
+        session.ready.set()
+        self.sessions[session.id] = session   # before any await, so a second text from this number finds it
+        if first_text and first_text.strip():
+            await self.handle_reply(session, first_text, event_id=event_id)
+        else:
+            await self._ask_address(session)
+        return session
+
+    def _start_loading(self, session: Session, candidates: list[dict] | None = None) -> None:
+        """Load the building in the background: `candidates` from resolve (caller-initiated calls), else the models
+        find_matches gives for session.address (or session.requested_model). Shared by start_call and the intake."""
+        session.load_candidates = candidates
+        session.status, session.status_detail = "loading", "Looking up the address..."
+        session.ready.clear()
+        asyncio.create_task(self._load(session))
 
     async def _load(self, session: Session) -> None:
         try:
-            if session.requested_model:
+            if session.load_candidates is not None:
+                matches = session.load_candidates
+            elif session.requested_model:
                 matches = [{"id": session.requested_model, "name": session.address, "address": session.address,
                             "score": 1.0, "exact": True}]
             else:
@@ -154,12 +197,11 @@ class SessionManager:
                 detail = "No Matterport property with a sufficiently similar address."
                 if tried:
                     detail = f"Similar Matterport properties had no usable interior: {'; '.join(tried)}."
-                session.status, session.status_detail = "no_model", detail
-                await self._say(session, questions.NO_MODEL_MESSAGE)
+                await self._transfer(session, detail)
                 return
 
             async with session.lock:
-                if session.ended or session.status == "out":
+                if session.ended or session.status in ("out", "transferred"):
                     return
                 if session.requested_model:
                     actual = loaded.building.address
@@ -174,7 +216,7 @@ class SessionManager:
                 session.status, session.status_detail = "listening", "Waiting for the caller's description."
                 await self.notify(session)
                 asyncio.create_task(self._load_orientation(session))
-                if session.channel == "voice" and not session.match["exact"]:
+                if session.channel == "voice" and not session.match["exact"] and not session.address_confirmed:
                     session.waiting_for_match = True
                     await self._say(session, f"The available floor plan is for {session.match['address']}. Is that the correct building?")
                 elif session.queued:
@@ -237,13 +279,27 @@ class SessionManager:
         if not text:
             return
         session.messages.append({"id": uuid.uuid4().hex, "role": "caller", "text": shown, "ts": time.time()})
+        # A transferred call is with standard 911 now: its texts are recorded only (safety advice aside).
+        signal = questions.out_signal(text) if session.status not in ("out", "transferred") else None
+        if session.out_pending:
+            # The answer to OUT_CONFIRM ("Are you outside the building now?").
+            session.out_pending = False
+            reply = questions.parse_reply(text)
+            if reply.kind == "yes" or signal == "out":
+                await self._caller_out(session)
+                return
+            if reply.kind == "no" and not reply.extra:
+                if session.out_resume:
+                    await self._say(session, session.out_resume)   # back to the question they were answering
+                else:
+                    await self.notify(session)
+                return
+            if reply.kind == "no":
+                text = reply.extra   # "no, I'm in the bedroom": read the rest as usual
+            signal = None
         # "Out" and danger are checked first, even while the building is still loading: neither should wait.
-        if session.status != "out" and questions.is_out(text):
-            # The caller got out: stop asking about rooms, so they don't keep texting next to a burning building.
-            session.status = "out"
-            session.status_detail = "Caller says they are out of the building."
-            session.pending, session.queued = None, []
-            await self._say(session, questions.OUT_MESSAGE)
+        if signal == "out":
+            await self._caller_out(session)
             return
         if session.status != "out" and questions.mentions_danger(text):
             # Smoke or fire where the caller is: the dispatcher sees it on the call, and the caller gets the smoke
@@ -252,7 +308,16 @@ class SessionManager:
             if not session.safety_sent:
                 session.safety_sent = True
                 await self._say(session, questions.SAFETY_MESSAGE)
+        if signal == "maybe":
+            # "I think I'm out", "we're by the mailbox": ask before stopping the room questions on a guess.
+            session.out_resume, session.out_pending = session.last_said, True
+            await self._say(session, questions.OUT_CONFIRM)
+            return
+        if session.status == "awaiting_address":
+            await self._intake(session, text)
+            return
         if session.waiting_for_match:
+            # Voice, after loading a non-exact match: "The available floor plan is for <address>. Is that correct?"
             answer = questions.parse_reply(text).kind
             if answer == "yes":
                 session.waiting_for_match = False
@@ -262,11 +327,17 @@ class SessionManager:
                 else:
                     await self._say(session, "Tell us what room you’re in and what you can see around you.")
             elif answer == "no":
+                # Wrong building: forget it and ask for the address again (or hand off once retries are used up).
                 session.waiting_for_match = False
                 session.queued.clear()
-                session.status, session.model_id = "no_model", None
-                session.status_detail = "Caller rejected the suggested building."
-                await self._say(session, "Please start again with the complete address.")
+                if session.model_id:
+                    session.rejected_models.add(session.model_id)
+                session.model_id = session.match = session.requested_model = None
+                session.posterior = session.estimate = session.pending = None
+                session.address, session.load_candidates = "", None
+                session.status = "awaiting_address"
+                session.address_asked = True
+                await self._address_failed(session, "Caller rejected the suggested building.")
             else:
                 await self._say(session, "Please say yes or no to confirm the building address.")
             return
@@ -282,6 +353,112 @@ class SessionManager:
             return
         # A located call keeps listening: "actually I'm upstairs" must still move the estimate.
         await self._process(session, text)
+
+    async def _caller_out(self, session: Session) -> None:
+        # The caller got out: stop asking about rooms, so they don't keep texting next to a burning building.
+        session.status = "out"
+        session.status_detail = "Caller says they are out of the building."
+        session.pending, session.queued = None, []
+        session.waiting_for_match, session.address_options = False, []
+        await self._say(session, questions.OUT_MESSAGE)
+
+    # ---- address intake (caller-initiated calls) --------------------------------------------------------------
+
+    async def _ask_address(self, session: Session, text: str = questions.ADDRESS_QUESTION) -> None:
+        session.address_asked, session.address_prompt = True, text
+        await self._say(session, text)
+
+    async def _intake(self, session: Session, text: str) -> None:
+        """One caller message while the call has no building yet (status awaiting_address)."""
+        if session.waiting_for_match and session.address_options:
+            await self._address_answer(session, text)
+        elif not session.address_asked and not questions.looks_like_address(text):
+            await self._ask_address(session)   # "hello" / "help" as the first text: ask for the address
+        else:
+            await self._try_address(session, text)
+
+    async def _try_address(self, session: Session, text: str) -> None:
+        session.status_detail = "Looking up the caller's address..."
+        await self.notify(session)
+        found = await asyncio.to_thread(resolve.resolve, text, frozenset(session.rejected_models))
+        session.address_heard = found.cleaned
+        options = found.candidates[:2 if found.band == "choose" else 1]
+        if found.band == "match" and options:
+            await self._accept_address(session, options[0], confirmed=False)
+        elif found.band in ("clarify", "choose") and options:
+            session.address_options, session.waiting_for_match, session.address_reasked = options, True, False
+            session.address_distinguishing = list(found.distinguishing) if len(options) > 1 else []
+            if len(options) > 1:
+                prompt = questions.ADDRESS_CHOOSE.format(a=options[0]["address"], b=options[1]["address"])
+                session.status_detail = (f"Caller said “{found.cleaned}”; asking which of two similar addresses: "
+                                         f"{options[0]['address']} or {options[1]['address']}.")
+            else:
+                prompt = questions.ADDRESS_CONFIRM.format(address=options[0]["address"])
+                session.status_detail = (f"Caller said “{found.cleaned}”; asking to confirm the closest address: "
+                                         f"{options[0]['address']} ({round(options[0]['score'] * 100)}% similar).")
+            await self._ask_address(session, prompt)
+        elif not questions.looks_like_address(text) and not session.address_nudged:
+            # "There's smoke, please hurry" isn't a wrong address: ask again without using up the retry.
+            session.address_nudged = True
+            session.status_detail = "Waiting for the caller's address."
+            await self._ask_address(session)
+        else:
+            await self._address_failed(session, f"No Matterport property matches “{found.cleaned}”.")
+
+    async def _address_answer(self, session: Session, text: str) -> None:
+        """The answer to ADDRESS_CONFIRM ("Did you mean ...?") or ADDRESS_CHOOSE ("Is it A or B?")."""
+        options = session.address_options
+        reply = questions.parse_reply(text)
+        if len(options) == 1:
+            pick = 0 if reply.kind == "yes" else None
+        else:
+            pick = _pick_option(text, options, session.address_distinguishing)
+        rejected = pick is None and (reply.kind == "no" or bool(_NEITHER.search(text)))
+        if pick is None and not rejected and not session.address_reasked and not questions.looks_like_address(text):
+            session.address_reasked = True
+            await self._say(session, f"{questions.NOT_UNDERSTOOD} {session.address_prompt}")
+            return
+        session.waiting_for_match, session.address_options, session.address_distinguishing = False, [], []
+        if pick is not None:
+            session.messages.append({"role": "system", "text": f"Caller confirmed the address: {options[pick]['address']}.",
+                                     "ts": time.time()})
+            await self._accept_address(session, options[pick], confirmed=True)
+            return
+        if not rejected:
+            # Neither yes nor no but another address ("no wait, it's 13120"): look that one up instead.
+            await self._try_address(session, text)
+            return
+        session.rejected_models |= {option["id"] for option in options}
+        extra = reply.extra if reply.kind == "no" else ""
+        if extra and questions.looks_like_address(extra):
+            # "No, it's 13120 Chipman Glen": a rejection and the corrected address in one message.
+            session.address_attempts += 1
+            if session.address_attempts <= config.ADDRESS_RETRIES:
+                await self._try_address(session, extra)
+            else:
+                await self._transfer(session, "Caller rejected the suggested addresses.")
+            return
+        await self._address_failed(session, "Caller rejected the suggested address.")
+
+    async def _accept_address(self, session: Session, match: dict, confirmed: bool) -> None:
+        session.address = session.address_heard or match["address"]
+        session.address_confirmed = confirmed
+        await self._say(session, questions.OPENING_MESSAGE)
+        self._start_loading(session, [match])
+
+    async def _address_failed(self, session: Session, reason: str) -> None:
+        """An address that didn't resolve or was rejected: ask again while retries remain, then hand off."""
+        session.address_attempts += 1
+        if session.address_attempts > config.ADDRESS_RETRIES:
+            await self._transfer(session, reason)
+            return
+        session.status, session.status_detail = "awaiting_address", f"{reason} Asked the caller again."
+        await self._ask_address(session, questions.ADDRESS_RETRY)
+
+    async def _transfer(self, session: Session, reason: str) -> None:
+        """Outside the coverage: hand the call to standard 911 (a recorded stub, see handoff.py) and tell the caller."""
+        handoff.transfer_to_emergency_services(session, reason)
+        await self._say(session, questions.OUT_OF_AREA_MESSAGE)
 
     async def _process(self, session: Session, text: str) -> None:
         loaded = self.buildings[session.model_id]
@@ -574,7 +751,7 @@ class SessionManager:
         text = text.strip()
         if not text:
             return "The question is empty."
-        if session.ended or session.status in ("out", "no_model", "error"):
+        if session.ended or session.status in ("out", "no_model", "error", "transferred"):
             return "This call isn't taking questions."
         session.pending = followups.Plan("custom", "custom", text, purpose="dispatcher") \
             if session.posterior is not None else None
@@ -612,18 +789,35 @@ class SessionManager:
         return locator.estimate(session.posterior, loaded.building.candidate_room, len(loaded.building.rooms))
 
     async def _say(self, session: Session, text: str, source: str = "system") -> None:
-        """Text the caller. `source` is "dispatcher" for questions the dispatcher typed (shown as such in the log)."""
+        """Text the caller. `source` is "dispatcher" for questions the dispatcher typed (shown as such in the log).
+        Every message goes through questions.for_channel, so a voice call gets the spoken wording."""
+        if text not in (questions.SAFETY_MESSAGE, questions.OUT_CONFIRM):
+            session.last_said = text   # the last question or instruction, for OUT_CONFIRM's "no"
+        text = questions.for_channel(text, session.channel)
         session.messages.append({"role": "dispatch", "text": text, "ts": time.time(), "source": source})
         try:
-            if session.channel != "voice":
-                await messaging.send(session.phone, text)
+            to = session.phone or session.handle
+            if session.channel != "voice" and to:
+                await messaging.send(to, text)
         except messaging.MessagingError as exc:
             session.messages.append({"role": "system", "text": str(exc), "ts": time.time()})
         await self.notify(session)
 
-    def find_by_phone(self, phone: str) -> Session | None:
-        key = normalize_phone(phone)
-        matches = [s for s in self.sessions.values() if s.channel != "voice" and normalize_phone(s.phone) == key]
+    def find_by_phone(self, phone: str | None) -> Session | None:
+        """The open text call for this number: not voice, not ended, and active within SESSION_REUSE_MINUTES. None
+        when there is none, so the next text opens a new call. An unknown number (None) matches nothing."""
+        key = phones.to_e164(phone)
+        handle = (phone or "").strip().casefold() if key is None else None
+        if key is None and not handle:
+            return None
+        cutoff = time.time() - config.SESSION_REUSE_MINUTES * 60
+
+        def same(s: Session) -> bool:
+            if key is not None:
+                return bool(s.phone) and phones.to_e164(s.phone) == key
+            return s.handle is not None and s.handle.casefold() == handle
+        matches = [s for s in self.sessions.values()
+                   if s.channel != "voice" and not s.ended and same(s) and _last_activity(s) >= cutoff]
         return max(matches, key=lambda s: s.created) if matches else None
 
     def room_shots(self, session: Session) -> list[dict]:
@@ -773,6 +967,39 @@ class SessionManager:
         await self._notify(session)
 
 EVIDENCE_LOG_LENGTH = 20
+
+_NEITHER = re.compile(r"\b(neither|none|nope|not (?:either|both|those|them|that))\b", re.I)
+_FIRST = re.compile(r"\b(first|former|1st|the one before)\b", re.I)
+_SECOND = re.compile(r"\b(second|latter|last|2nd|other one)\b", re.I)
+
+
+def _last_activity(session: Session) -> float:
+    return max([session.created, *(m["ts"] for m in session.messages)])
+
+
+def _pick_option(text: str, options: list[dict], distinguishing: list[str]) -> int | None:
+    """Which of two suggested addresses the caller picked, or None: the part that differs ("13122", "unit 107", also
+    spoken: "thirteen one twenty two"), "the first/second one", or the address said in full."""
+    folded = text.casefold()
+    if alpha2digit is not None:
+        try:
+            folded = alpha2digit(folded, "en")
+        except Exception:  # text2num is strict about some inputs; the plain text still works below
+            pass
+    compact = re.sub(r"(?<=\d)\s+(?=\d)", "", folded)   # "13 1 22" -> "13122"
+    if len(distinguishing) == len(options):
+        hits = [i for i, part in enumerate(distinguishing)
+                if part and re.search(rf"(?<!\w){re.escape(part.casefold())}(?!\w)", compact)]
+        if len(hits) == 1:
+            return hits[0]
+    first, second = bool(_FIRST.search(folded)), bool(_SECOND.search(folded))
+    if first != second:
+        return 0 if first else 1
+    scores = [similarity(text, option["address"]) for option in options]
+    best = int(np.argmax(scores))
+    if scores[best] >= config.ADDRESS_MATCH_THRESHOLD and scores[best] - min(scores) >= 0.05:
+        return best
+    return None
 
 
 def room_denial(building: Building, denied: set[str]) -> np.ndarray | None:

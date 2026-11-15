@@ -441,3 +441,52 @@ button.floor-tab.active { border-color: var(--room); background: var(--bg); font
   .plan-controls .panel-tools { order: 0; }
   .panel { padding: 14px; }
 }
+
+/* Responder screen: call list badges, the "Go to" headline, the new-call alert and the hidden test tools. */
+.topbar-meta .active-count { color: var(--muted); }
+.calls-title { margin: 0 0 var(--space-2); }
+.session-top { display: flex; align-items: center; gap: 8px; font-size: 0.75rem; }
+.session-phone { font-weight: 600; font-variant-numeric: tabular-nums; }
+.session-age { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; }
+.session-address.pending { color: var(--muted); font-weight: 500; font-style: italic; }
+button.session.attention { border-left: 3px solid var(--accent); padding-left: 8px; }
+button.session.ended { opacity: 0.7; }
+.badge { display: inline-block; padding: 1px 6px; font-size: 0.66rem; font-weight: 700; letter-spacing: 0.06em;
+  text-transform: uppercase; border: 1px solid currentColor; }
+.badge-voice { color: var(--room); }
+.badge-text { color: var(--muted); }
+.flag { color: var(--accent); font-weight: 700; }
+.pill-out { color: var(--ok); }
+.pill-transferred, .pill-awaiting_address { color: var(--warn); }
+.headline-caller { display: flex; align-items: center; gap: 8px; font-size: 0.8rem; color: var(--muted);
+  font-variant-numeric: tabular-nums; }
+.headline-ended { color: var(--muted); font-weight: 700; text-transform: uppercase; font-size: 0.68rem; letter-spacing: 0.08em; }
+.go-to { display: block; font-size: 0.7rem; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--accent); }
+.go-floor { color: var(--accent); }
+.incident .incident-room { font-size: clamp(1.4rem, 2.6vw, 2.2rem); }
+.incident-waiting { color: var(--muted); }
+.incident-approach { font-size: 1rem; font-weight: 600; }
+.incident-odds .conf { font-size: 0.8rem; }
+.headline-danger { display: inline-block; width: max-content; margin-top: var(--space-1); padding: 4px 10px;
+  color: var(--surface); background: var(--accent); font-weight: 700; font-size: 0.85rem; }
+.headline-danger::before { content: "! "; }
+.incident-out .incident-room { color: var(--ok); }
+.incident-transferred .incident-room { color: var(--warn); }
+.stub-note { margin-top: var(--space-1); padding: 6px 10px; border: 1px dashed var(--border); color: var(--muted);
+  font-size: 0.8rem; max-width: 70ch; }
+.new-call-alert { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2);
+  margin-bottom: var(--space-2); padding: 10px 14px; color: var(--surface); background: var(--text); font-weight: 600; }
+.new-call-alert button { color: var(--text); padding: 4px 12px; }
+.test-tools { margin-top: var(--space-4); padding-top: var(--space-3); border-top: 1px dashed var(--border); }
+.test-tools > summary { cursor: pointer; font-size: 0.7rem; font-weight: 700; letter-spacing: 0.085em; text-transform: uppercase; }
+.test-tools > form { margin-top: var(--space-3); }
+.test-tools .side-title { font-size: 0.7rem; }
+.conf { font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; }
+.conf-located { color: var(--ok); }
+.conf-likely { color: var(--room); }
+.conf-possible, .conf-unsure { color: var(--warn); }
+.test-tools .caller-box { margin-top: var(--space-3); }
+.sidebar > .side-title.calls-title { margin: 0 0 var(--space-2); padding-top: 0; border-top: 0; }
+.test-tools .caller-row input { flex: 1 1 auto; width: 0; }
+.test-tools .caller-row button { flex: none; }

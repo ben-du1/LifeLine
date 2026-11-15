@@ -4,10 +4,9 @@
 
 **HackPrinceton Fall 2026 · CoStar × Matterport track ("Inside and Out: AI for the Built World")**
 
-When someone calls 911 from inside a burning or smoke-filled building, responders get an address, not a room.
-A trapped caller can rarely give one either: they're panicking, it's dark, or it isn't their home. LifeLine turns
-a short text or voice conversation with the caller into **a dot on the building's floor plan**, using the
-building's Matterport 3D scan.
+An address can bring responders to a building, but it does not tell them which room or floor to search.
+LifeLine speaks with the caller over the phone or iMessage, matches their descriptions to a Matterport 3D scan,
+and shows the estimated location on the building’s floor plan.
 
 - **What the dispatcher sees:** the conversation, the most likely rooms with probabilities, a north-up floor plan
   with the caller's estimated position, and the room's photos. An approach card says which side of the building
@@ -19,21 +18,17 @@ building's Matterport 3D scan.
 
 ## Demo in one minute
 
-1. **The call:** the dispatcher types the caller's phone number and address into the dashboard. A real deployment
-   would take these from the 911 system.
-2. **The building:** LifeLine finds the closest-matching Matterport scan for that address, out of the ~15,000 our
-   hackathon key can reach. Approximate matches are flagged.
-3. **The caller:** gets an iMessage via Photon (or talks to a voice agent): *"If you can get out safely, get out now
-   and text OUT. If you can't, tell us what room you're in and what you can see around you."*
-4. **Narrowing down:** the caller says *"I'm in a cramped space."* LifeLine replies *"You said it's a tight space.
-   Can you see a sink or faucet?"* Every answer updates the probabilities live on the dashboard.
-5. **Located:** once one room clearly leads, the dot appears and the caller is told where responders will look.
-   If the room still can't be pinned down, it stops with an honest best guess naming the candidate rooms.
+1. **The caller calls LifeLine.** The Photon number connects to an ElevenLabs voice agent, which asks for the building address. A caller can also start by texting the assigned iMessage line.
+2. **LifeLine finds the building.** It matches the caller’s address to an accessible Matterport model and asks for clarification when the match is ambiguous.
+3. **The conversation locates the room.** The caller describes what they see. LifeLine selects the next question, and the voice agent asks it aloud. Each answer updates the room and floor estimates.
+4. **Responders see the search unfold.** The live dashboard shows the transcript, candidate rooms, floor plan, location marker, and room photos. If the evidence remains ambiguous, LifeLine reports its best guess.
+
+For a live presentation, use a building and caller responses your team has rehearsed.
 
 ## How it works
 
 ```
- caller (iMessage / voice)                            dispatcher dashboard (React)
+ caller (Photon iMessage / Photon + ElevenLabs voice)    responder dashboard (React)
           │  replies                                          ▲  live updates (WebSocket)
           ▼                                                   │
  ┌──────────────────────────── FastAPI backend (CPU only) ────────────────────────────┐
@@ -95,18 +90,18 @@ call for the dispatcher.
 
 ## Results
 
-All of these were run without an LLM key, on the keyword and paraphrase rules alone.
+In the team’s latest evaluation, the updated location logic identified **18 of 19 rooms**. The team also tested the phone questioning flow end to end with Photon and ElevenLabs. The repository’s scripted scenarios include an earlier run, shown below for context.
 
 | Check | Result |
 |---|---|
-| Scripted callers on 3 real Matterport buildings (`backend/scripts/eval_scenarios.py`) | **15/19** right room. Every miss ends as a best guess naming the candidates; none is a confidently wrong "located". |
-| 4-floor building (3012 Houston Ave, 60 rooms) | **4/4 rooms, 4/4 floors** |
+| Updated room-location logic | **18/19** rooms in the team’s latest evaluation |
+| Earlier scripted callers (`backend/scripts/eval_scenarios.py`) | **15/19** rooms, including **4/4** rooms and floors in a multi-floor building |
 | Paraphrases with no feature keywords (*"I'm right next to where you cook"*) | Understood locally, no cloud model |
-| iMessage via Photon | Verified end to end with a real phone: questions delivered, replies read, estimate updated |
-| Automated tests | 312 passing; most run offline with a fake CLIP |
+| iMessage via Photon | Questions delivered, replies read, and estimates updated on a real phone |
+| Phone via Photon and ElevenLabs | Team-tested end-to-end address intake and room questioning |
+| Automated tests | Backend and voice test suites are included in the repository |
 
-The misses are the honest hard cases: identical empty bedrooms, bathrooms with no photos, and a room labelled
-"laundry" that has no washing machine.
+The earlier scripted run highlights difficult cases such as identical empty bedrooms, bathrooms without photos, and misleading room labels.
 
 ## Design challenges
 
@@ -136,7 +131,7 @@ The misses are the honest hard cases: identical empty bedrooms, bathrooms with n
 ## Future improvements
 
 - **Real 911 integration:** take the caller's number, address and device location from the 911 system (NG911 /
-  dispatch software), instead of typing them in.
+  dispatch software, alongside the current caller-initiated flow.
 - **Use the phone's own sensors:** Wi-Fi and barometric pressure from the caller's phone would settle the floor and
   narrow the room before the first question.
 - **Track the responders too:** a boot-mounted inertial sensor could show firefighters' positions on the same floor
@@ -149,13 +144,11 @@ The misses are the honest hard cases: identical empty bedrooms, bathrooms with n
   as the ground floor.
 - **Languages and accessibility:** questions in the caller's language, and a mode for callers who can only tap
   answers.
-- **Live voice:** the ElevenLabs voice agent is wired to the same engine but hasn't been verified on a live phone
-  call.
 
 ## Run it
 
 Requirements: Python 3.11+, Node.js 20+, and a Matterport API token in a repo-root `.env` (copy `.env.example`).
-Photon, ElevenLabs, Vexcel and Anthropic keys are optional.
+The browser rehearsal needs no phone services. The live voice path needs Photon and ElevenLabs setup; iMessage needs Photon. Vexcel and Anthropic are optional.
 
 ```bash
 # Backend (CPU only)
@@ -168,11 +161,8 @@ cd backend && .venv/Scripts/python -m uvicorn app.main:app --port 8000
 cd dashboard && npm install && npm run dev        # http://localhost:5173
 ```
 
-- **Try it:** call `13122 Chipman Glen Dr, Houston, TX` and, in the simulated caller box, type *"I can see a stove
-  and a fridge"*.
-- **Multi-floor:** call `3012 Houston Ave, Houston, TX` and say *"I'm in an empty room with built-in shelves"*.
-- **Real texting and voice:** see [AGENTS.md](AGENTS.md) for the iMessage sidecar and
-  [voice/README.md](voice/README.md) for the voice agent.
+- **Browser rehearsal:** open the dashboard with `?test=1` to reveal caller simulation controls.
+- **Phone and iMessage:** follow [voice setup](voice/README.md) for the Photon–ElevenLabs phone path and [messaging setup](AGENTS.md#messaging-photon) for iMessage. Use an address and room description the team has verified before a live demo.
 
 ## Repository
 

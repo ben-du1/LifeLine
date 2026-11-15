@@ -35,75 +35,77 @@ export default function FloorPlan({ building, session, floor = 0, showPhoto, sel
   };
 
   return (
-    <svg
-      className="floorplan"
-      viewBox={`${view.x} ${view.y} ${view.w} ${view.h}`}
-      role="img"
-      aria-label="Floor plan with predicted caller position"
-    >
-      {showPhoto && fp && (
-        <g transform={`rotate(${-yawDeg})`}>
-          <image
-            href={fp.url}
-            x={fp.origin.x}
-            y={-(fp.origin.y + fp.height / fp.resolution)}
-            width={fp.width / fp.resolution}
-            height={fp.height / fp.resolution}
-            opacity="0.45"
-          />
-        </g>
-      )}
-      {street && <StreetBand street={street} bounds={bounds} />}
-      {building.rooms.map((room, index) => {
-        if (!onFloor(room)) return null;
-        const p = roomProbability[index] ?? 0;
-        const isTop = estimate?.room === index;
-        return (
-          <g key={room.id}>
-            {room.polygon && (
-              <polygon
-                points={room.polygon.map(([x, y]) => P(x, y).join(",")).join(" ")}
-                className="room-fill"
-                // Keep a faint fill even at 0% so every room is clickable for its photos.
-                style={{ fillOpacity: Math.max(0.04, Math.min(0.85, p * 1.2)) }}
-                data-top={isTop || undefined}
-                data-selected={selectedRoom === index || undefined}
-                onClick={() => onSelectRoom?.(index)}
-              >
-                <title>{`${room.name}: click to see its photos`}</title>
-              </polygon>
-            )}
-            {room.walls.map(([x1, y1, x2, y2], i) => {
-              const [ax, ay] = P(x1, y1);
-              const [bx, by] = P(x2, y2);
-              return <line key={i} x1={ax} y1={ay} x2={bx} y2={by} className="wall" />;
-            })}
+    <div className="floorplan-viewer">
+      <svg
+        className="floorplan"
+        viewBox={`${view.x} ${view.y} ${view.w} ${view.h}`}
+        role="img"
+        aria-label="Floor plan with predicted caller position"
+      >
+        {showPhoto && fp && (
+          <g transform={`rotate(${-yawDeg})`}>
+            <image
+              href={fp.url}
+              x={fp.origin.x}
+              y={-(fp.origin.y + fp.height / fp.resolution)}
+              width={fp.width / fp.resolution}
+              height={fp.height / fp.resolution}
+              opacity="0.45"
+            />
           </g>
-        );
-      })}
-      {building.rooms.map((room, index) => {
-        if (!room.centroid || !onFloor(room)) return null;
-        const [cx, cy] = P(room.centroid[0], room.centroid[1]);
-        return (
-          <text key={room.id} x={cx} y={cy} className="room-label">
-            <tspan x={cx}>{room.name}</tspan>
-            {session?.rooms?.length > 0 && (
-              <tspan x={cx} dy="0.45" className="room-prob">
-                {Math.round((roomProbability[index] ?? 0) * 100)}%
-              </tspan>
-            )}
-          </text>
-        );
-      })}
-      {(session?.candidate_probabilities || []).map((p, i) => {
-        const c = building.candidates[i];
-        if (!onFloor(building.rooms[roomIndex[c.room_id]])) return null;
-        const [cx, cy] = P(c.x, c.y);
-        return <circle key={c.id} cx={cx} cy={cy} r={0.12 + 0.35 * Math.sqrt(p)} className="sweep" />;
-      })}
-      {showEstimate && <Marker at={P(estimate.x, estimate.y)} radius={estimate.radius_m} located={located} />}
-      {orientation && <Compass x={view.x + 1.6} y={view.y + 1.8} />}
-    </svg>
+        )}
+        {street && <StreetBand street={street} bounds={bounds} />}
+        {building.rooms.map((room, index) => {
+          if (!onFloor(room)) return null;
+          const p = roomProbability[index] ?? 0;
+          const isTop = estimate?.room === index;
+          return (
+            <g key={room.id}>
+              {room.polygon && (
+                <polygon
+                  points={room.polygon.map(([x, y]) => P(x, y).join(",")).join(" ")}
+                  className="room-fill"
+                  // Keep a faint fill even at 0% so every room is clickable for its photos.
+                  style={{ fillOpacity: Math.max(0.04, Math.min(0.85, p * 1.2)) }}
+                  data-top={isTop || undefined}
+                  data-selected={selectedRoom === index || undefined}
+                  onClick={() => onSelectRoom?.(index)}
+                >
+                  <title>{`${room.name}: click to see its photos`}</title>
+                </polygon>
+              )}
+              {room.walls.map(([x1, y1, x2, y2], i) => {
+                const [ax, ay] = P(x1, y1);
+                const [bx, by] = P(x2, y2);
+                return <line key={i} x1={ax} y1={ay} x2={bx} y2={by} className="wall" />;
+              })}
+            </g>
+          );
+        })}
+        {building.rooms.map((room, index) => {
+          if (!room.centroid || !onFloor(room)) return null;
+          const [cx, cy] = P(room.centroid[0], room.centroid[1]);
+          return (
+            <text key={room.id} x={cx} y={cy} className="room-label">
+              <tspan x={cx}>{room.name}</tspan>
+              {session?.rooms?.length > 0 && (
+                <tspan x={cx} dy="0.45" className="room-prob">
+                  {Math.round((roomProbability[index] ?? 0) * 100)}%
+                </tspan>
+              )}
+            </text>
+          );
+        })}
+        {(session?.candidate_probabilities || []).map((p, i) => {
+          const c = building.candidates[i];
+          if (!onFloor(building.rooms[roomIndex[c.room_id]])) return null;
+          const [cx, cy] = P(c.x, c.y);
+          return <circle key={c.id} cx={cx} cy={cy} r={0.12 + 0.35 * Math.sqrt(p)} className="sweep" />;
+        })}
+        {showEstimate && <Marker at={P(estimate.x, estimate.y)} radius={estimate.radius_m} located={located} />}
+      </svg>
+      {orientation && <Compass />}
+    </div>
   );
 }
 
@@ -120,13 +122,13 @@ function Marker({ at: [x, y], radius, located }) {
 }
 
 // North arrow. The plan is drawn north-up whenever this is shown.
-function Compass({ x, y }) {
+function Compass() {
   return (
-    <g className="compass" transform={`translate(${x} ${y})`}>
-      <circle r="1.1" />
-      <path d="M0,-0.85 L0.32,0.3 L0,0.1 L-0.32,0.3 Z" />
-      <text y="-1.35">N</text>
-    </g>
+    <svg className="compass" viewBox="0 0 44 44" role="img" aria-label="North is up">
+      <circle cx="22" cy="22" r="21.25" />
+      <path d="M22,10 L29,34 L22,29 L15,34 Z" />
+      <text x="22" y="-5">N</text>
+    </svg>
   );
 }
 

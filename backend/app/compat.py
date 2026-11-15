@@ -2,7 +2,7 @@
 
 Usage: python -m app.compat <model_id> [<model_id> ...]   (scores cached data/buildings/<id>/building.json)
 
-The checks follow the README's "Evaluation": calls fail on identical rooms, rooms without photos, labels that
+The checks follow "Evaluation" in AGENTS.md: calls fail on identical rooms, rooms without photos, labels that
 contradict photos, and vacant houses. So a good demo model has most rooms photographed, every room labelled, many
 distinct room types, few look-alike rooms, and furniture. Two inputs share one scorer (`score_rooms`):
   - score_building(): a cached building.json from ingest.py (already filtered: no Void rooms, no outdoor regions).
@@ -24,7 +24,7 @@ from .followups import _polygon_area
 # kitchen/dining/living room is ~60 m².
 VERY_LARGE_ROOM_M2 = 80.0
 # Same-type rooms whose floor areas are within 20% of each other look alike to a caller ("a bedroom with a window")
-# and to the size question. Chipman Glen's Bedrooms 2 and 3 (13 vs 14 m²) are the README's tied pair.
+# and to the size question. Chipman Glen's Bedrooms 2 and 3 (13 vs 14 m²) are AGENTS.md's tied pair.
 SIMILAR_AREA_RATIO = 1.2
 # A 2-minute demo has time for one floor question. More than 3 floors means a long floor list and more questions.
 MAX_DEMO_FLOORS = 3
@@ -33,7 +33,7 @@ MAX_DEMO_FLOORS = 3
 GOOD_ROOM_COUNT = (5, 25)
 # Key room -> substring of a classification ("Half Bath" counts as a bathroom).
 KEY_ROOM_TYPES = {"kitchen": "kitchen", "bathroom": "bath", "bedroom": "bedroom"}
-# Words in Matterport's generated description that mean an empty house. Empty bedrooms are the README's main tie.
+# Words in Matterport's generated description that mean an empty house. Empty bedrooms are AGENTS.md's main tie.
 VACANT_WORDS = re.compile(r"\b(vacant|unfurnished|unoccupied|empty|bare|no furniture|devoid of furniture)\b", re.I)
 FURNISHED_WORDS = re.compile(r"\b(furnished|furniture|sofa|couch|bed frame|dining table|decor)\b", re.I)
 
@@ -62,7 +62,7 @@ def _kind(room: dict) -> str:
 def _lookalike_groups(rooms: list[dict]) -> list[list[dict]]:
     """Groups of 2+ rooms with the same kind and areas within SIMILAR_AREA_RATIO. Rooms of unknown area match any
     same-kind room, because nothing tells them apart. Unlabelled rooms ("Room 1", "Room 2") form one group whatever
-    their size: a caller can't name them, and size alone rarely settled a call in the README's evaluation."""
+    their size: a caller can't name them, and size alone rarely settled a call in AGENTS.md's evaluation."""
     by_kind = defaultdict(list)
     for room in rooms:
         by_kind[_kind(room)].append(room)

@@ -121,7 +121,7 @@ def prescore(row: dict) -> float:
 def shortlist(index_path: Path, out: Path, segment: str, limit: int) -> list[dict]:
     with index_path.open(newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
-    # How many models share each street address: a typed address then matches several models (README "Address
+    # How many models share each street address: a typed address then matches several models (AGENTS.md "Address
     # matching"), and the demo may open the wrong one.
     shared = Counter(k for k in (_street_key(r["address"] or r["name"]) for r in rows) if k)
     picked = []

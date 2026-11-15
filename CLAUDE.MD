@@ -10,8 +10,9 @@
 HackPrinceton Fall 2026 MVP (CoStar × Matterport track, Devpost hard stop Nov 15 2026, 8:00 AM ET). A 911 dispatcher enters a
 caller's phone and address. The system finds the building's Matterport digital twin, texts the caller (Photon
 iMessage, or a simulated caller box), asks follow-up questions, and puts a dot on the room the caller is in.
-**README.md is the full spec and status page:** read its "Status" table first, and keep it current when behaviour
-changes.
+**AGENTS.md is the full spec and status page:** read its "Status" table first, and keep it current when behaviour
+changes. README.md is the public front page for judges (what it does, how it works, design challenges, future work):
+update it only when the story changes, not for every tuning detail.
 
 ## Layout
 - `backend/app/`: FastAPI (Python 3.11, CPU only). Start at `sessions.py`, which holds the call flow.
@@ -82,5 +83,5 @@ changes.
   the floor tabs and the per-floor plan. That building's "nearest street" is Woodland Street (Nominatim returns only
   the single nearest road, so a corner lot shows one street).
 - **Claude layer:** verify live once a key is provided.
-- **Known accuracy limits:** identical rooms, rooms without photos, and labels that contradict the photos (see the
-  README's "Evaluation").
+- **Known accuracy limits:** identical rooms, rooms without photos, and labels that contradict the photos (see
+  "Evaluation" in AGENTS.md).

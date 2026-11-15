@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import uuid
 import re
 from contextlib import asynccontextmanager
 
@@ -11,11 +12,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import catalog, config, demo, embeddings, geo, llm, orientation, semantics
-from .sessions import Session, SessionManager
-from .voice_routes import create_router, cached_models
+from .sessions import Session, SessionManager, cached_models
+from .voice_routes import create_router
 
 logging.basicConfig(level=logging.INFO)
 clients: set[WebSocket] = set()
+INSTANCE_ID = uuid.uuid4().hex
 
 
 async def broadcast(session: Session) -> None:
@@ -191,6 +193,7 @@ async def get_building_aerial(model_id: str) -> dict:
 @app.websocket("/ws")
 async def websocket(ws: WebSocket) -> None:
     await ws.accept()
+    await ws.send_json({"type": "hello", "instance": INSTANCE_ID})
     clients.add(ws)
     try:
         for session in sorted(manager.sessions.values(), key=lambda s: s.created):

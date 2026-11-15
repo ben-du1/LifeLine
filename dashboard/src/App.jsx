@@ -25,6 +25,26 @@ function mergeSession(sessions, incoming) {
   return { ...sessions, [incoming.id]: incoming };
 }
 
+class SessionBoundary extends React.Component {
+  state = { failed: false };
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  render() {
+    if (this.state.failed) {
+      return (
+        <section className="panel" role="alert">
+          <p>Unable to display this call.</p>
+          <button onClick={() => this.setState({ failed: false })}>Retry call view</button>
+        </section>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 export default function App() {
   const [config, setConfig] = useState(null);
   const [sessions, setSessions] = useState({});
@@ -41,6 +61,7 @@ export default function App() {
     return subscribe(
       (session) => setSessions((prev) => mergeSession(prev, session)),
       setConnected,
+      () => { setSessions({}); setSelectedId(null); setBuildings({}); },
     );
   }, []);
 
@@ -108,7 +129,9 @@ export default function App() {
 
       <main className="main">
         {selected ? (
-          <SessionView session={selected} building={buildings[selected.model_id]} config={config} />
+          <SessionBoundary key={selected.id}>
+            <SessionView session={selected} building={buildings[selected.model_id]} config={config} />
+          </SessionBoundary>
         ) : (
           <div className="empty">Start a simulated 911 call to begin.</div>
         )}
@@ -552,7 +575,7 @@ function Conversation({ messages, evidence = [] }) {
   }, [messages.length, evidence.length]);
   const used = new Set();
   const effectFor = (m) => {
-    let entry = evidence.find((e, i) => !used.has(i) && e.ts === m.ts && e.text === m.text);
+    let entry = evidence.find((e, i) => !used.has(i) && (m.id ? e.message_id === m.id : e.ts === m.ts && e.text === m.text));
     entry ??= evidence.find((e, i) => !used.has(i) && e.text === m.text);
     if (entry) used.add(evidence.indexOf(entry));
     return entry;
@@ -580,7 +603,7 @@ function Conversation({ messages, evidence = [] }) {
 function CallerBox({ session, mode }) {
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
-  const open = ["listening", "loading", "located", "best_guess"].includes(session.status) && session.channel !== "voice";
+  const open = !session.ended && ["listening", "loading", "located", "best_guess"].includes(session.status) && session.channel !== "voice";
   const quick = ["Yes", "No", "I don't know"];
 
   async function send(value) {

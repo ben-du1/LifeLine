@@ -85,11 +85,14 @@ async def run(address, truth, opening, facts, verbose):
     while session.status == "listening":
         await manager.handle_reply(session, answer(session.pending, facts))
     snap = manager.snapshot(session)
+    if not snap["rooms"]:
+        print(f"BAD {truth}: {session.status_detail}")
+        return False
     top = snap["rooms"][0]
     ok = "OK " if top["name"] == truth else "BAD"
     floor_note = ""
     if len(snap["floors"]) > 1:  # also report whether the floor is right, even when the room isn't
-        true_floor = next(r["floor_label"] for r in snap["rooms"] if r["name"] == truth)
+        true_floor = next((r["floor_label"] for r in snap["rooms"] if r["name"] == truth), None)
         best_floor = max(snap["floors"], key=lambda f: f["probability"])
         floor_note = (f"  floor {'OK' if best_floor['label'] == true_floor else 'BAD'} "
                       f"({best_floor['label']} {best_floor['probability']:.2f})")

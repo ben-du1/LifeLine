@@ -34,14 +34,15 @@ export const sendReply = (sessionId, text) =>
 
 // Live session snapshots. Reconnects automatically because the backend may restart during development. While the
 // socket is down, the sessions are polled every 2 s instead, so the page never needs a reload to catch up.
-export function subscribe(onSession, onStatus) {
+export function subscribe(onSession, onStatus, onRestart) {
+  let instance;
   let ws;
   let closed = false;
   let live = false;
   const poll = setInterval(() => {
     if (live || closed) return;
     request("/api/sessions")
-      .then((list) => list.forEach(onSession))
+      .then((list) => { if (!live && !closed) list.forEach(onSession); })
       .catch(() => {});
   }, 2000);
   const connect = () => {
@@ -53,6 +54,10 @@ export function subscribe(onSession, onStatus) {
     };
     ws.onmessage = (event) => {
       const message = JSON.parse(event.data);
+      if (message.type === "hello") {
+        if (instance && instance !== message.instance) onRestart?.();
+        instance = message.instance;
+      }
       if (message.type === "session") onSession(message.session);
     };
     ws.onclose = () => {

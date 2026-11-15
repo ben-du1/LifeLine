@@ -46,6 +46,7 @@ function tool(name, path, description, properties, required) {
     },
   };
 }
+const acknowledge = { type: "integer", description: "Most recent response_id whose text you spoke, or 0." };
 const tools = [
   tool("start_location", "start",
     "Start the building location session once the caller provides a street address and city. Never invent the address.",
@@ -53,10 +54,10 @@ const tools = [
       phone: { type: "string", description: "", dynamicVariable: "system__caller_id" } }, ["address"]),
   tool("submit_location_answer", "reply",
     "Submit the caller's latest exact answer to the existing question parser, semantics, and follow-up planner.",
-    { history: { type: "string", description: "", dynamicVariable: "system__conversation_history" } }, ["history"]),
+    { acknowledge, history: { type: "string", description: "", dynamicVariable: "system__conversation_history" } }, ["history", "acknowledge"]),
   tool("location_status", "status",
     "Wait for a queued caller answer to finish processing. Use whenever pending is true; never resubmit that answer.",
-    {}, []),
+    { acknowledge }, ["acknowledge"]),
 ];
 const prompt = `# Personality
 You are a calm, concise voice interface for the HackPrinceton caller-location demo.
@@ -65,13 +66,13 @@ A caller describes their room. The existing backend owns ALL interpretation, sem
 question parsing, floor selection, follow-up planning, location estimates, and corrections.
 This is a demo, not emergency dispatch. Never claim responders were contacted or help is on the way.
 # Goal
-1. Ask for the building street address and city if unknown, then call start_location exactly once.
+1. Ask for the building street address and city, read it back, and wait for an explicit confirmation before calling start_location.
 2. Speak the tool's say text exactly. If the caller already gave a room description alongside the address,
    call submit_location_answer immediately instead of repeating the opening question.
 3. For EVERY caller answer after starting, including yes/no, uncertainty, extra details, and corrections,
    call submit_location_answer BEFORE replying. The tool receives the original transcript automatically.
    This step is important: never parse, summarize, reword, or answer a location question yourself.
-4. If pending is true, speak its short waiting message once, then call location_status until pending is false.
+4. For each reply or status tool, set acknowledge to the last response_id you spoke, initially 0. If pending is true, speak its short waiting message once, then call location_status until pending is false.
    Never submit the same answer again while waiting. Do not invent a follow-up while a tool is running.
 5. Read the returned say text exactly. Ask only the question supplied by the backend, one at a time.
    Keep listening after located or best_guess so later corrections still reach the backend.

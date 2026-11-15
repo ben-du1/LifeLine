@@ -6,6 +6,7 @@ Replies that arrive while the building is still loading are queued and processed
 """
 
 import asyncio
+import re
 import dataclasses
 import json
 import logging
@@ -35,6 +36,16 @@ class LoadedBuilding:
 
 
 @dataclass
+class Evidence:
+    topics: frozenset[str]
+    key: str
+    scores: np.ndarray | None
+    boost: np.ndarray | None
+    room: np.ndarray | None
+    position: np.ndarray | None
+
+
+@dataclass
 class Session:
     id: str
     phone: str
@@ -43,6 +54,11 @@ class Session:
     channel: str = "messaging"
     ready: asyncio.Event = field(default_factory=asyncio.Event)
     revision: int = 0
+    ended: bool = False
+    waiting_for_match: bool = False
+    ledger: list[Evidence] = field(default_factory=list)
+    floor_unresolved: bool = False
+    floor_retry_used: bool = False
     confirmed_floor: int | None = None
     evidence_texts: set[str] = field(default_factory=set)
     provider_events: set[str] = field(default_factory=set)
@@ -176,6 +192,8 @@ class SessionManager:
                 return
 
             async with session.lock:
+                if session.ended:
+                    return
                 if session.requested_model:
                     actual = loaded.building.address
                     session.match = {
@@ -189,7 +207,10 @@ class SessionManager:
                 session.status, session.status_detail = "listening", "Waiting for the caller's description."
                 await self.notify(session)
                 asyncio.create_task(self._load_orientation(session))
-                if session.queued:
+                if session.channel == "voice" and not session.match["exact"]:
+                    session.waiting_for_match = True
+                    await self._say(session, f"The available floor plan is for {session.match['address']}. Is that the correct building?")
+                elif session.queued:
                     text, session.queued = " ".join(session.queued), []
                     await self._process(session, text)
         except Exception as exc:  # surface any failure on the dashboard instead of leaving the call stuck
@@ -242,11 +263,33 @@ class SessionManager:
         if not text:
             return
         async with session.lock:
+            if session.ended:
+                return
             if event_id is not None:
                 if event_id in session.provider_events:
                     return
                 session.provider_events.add(event_id)
-            session.messages.append({"role": "caller", "text": text, "ts": time.time()})
+            message = {"id": uuid.uuid4().hex, "role": "caller", "text": text, "ts": time.time()}
+            session.messages.append(message)
+            if session.waiting_for_match:
+                reply = questions.parse_reply(text)
+                if reply.kind == "yes":
+                    session.waiting_for_match = False
+                    if session.queued:
+                        description, session.queued = " ".join(session.queued), []
+                        await self._process(session, description)
+                    else:
+                        await self._say(session, "Describe the room you are in.")
+                elif reply.kind == "no":
+                    session.waiting_for_match = False
+                    session.queued.clear()
+                    session.status = "no_model"
+                    session.model_id = None
+                    session.status_detail = "Caller rejected the suggested building."
+                    await self._say(session, "I could not confirm the floor plan. Please start again with the complete address.")
+                else:
+                    await self._say(session, "Please say yes or no to confirm the building address.")
+                return
             if session.status == "loading":
                 session.queued.append(text)
             elif session.status in ("listening", "located", "best_guess"):
@@ -255,6 +298,18 @@ class SessionManager:
                 except Exception:
                     log.exception("Could not process caller reply")
                     session.messages.append({"role": "system", "text": "Could not process this reply. Please try again.", "ts": time.time()})
+            await self.notify(session)
+
+    async def end_call(self, session: Session, reason: str) -> None:
+        async with session.lock:
+            if session.ended:
+                return
+            session.ended = True
+            session.ready.set()
+            session.queued.clear()
+            if session.status in ("loading", "listening"):
+                session.status = "best_guess" if session.estimate is not None else "error"
+            session.status_detail = reason
             await self.notify(session)
 
     async def _process(self, session: Session, text: str) -> None:
@@ -274,34 +329,53 @@ class SessionManager:
         reading = followups.read_message(text, loaded.features, session.pending, reply.kind, cues, semantic)
         before = locator.room_probabilities(session.posterior, building.candidate_room, len(building.rooms))
         stated_floors = followups.stated_floors(text, loaded.features.floor_options)
+        explicit_numbers = re.findall(r"\b(?:(\d+)(?:st|nd|rd|th)?\s+(?:floor|level)|(?:floor|level)\s+(\d+))\b", text, re.I)
+        unsupported = any(not 1 <= int(a or b) <= len(building.floors) for a, b in explicit_numbers)
+        if unsupported:
+            session.floor_unresolved = True
+            session.messages.append({"role": "system", "text": "The caller named a floor absent from the building model. The estimate is tentative.", "ts": time.time()})
+        elif len(stated_floors) == 1:
+            session.floor_unresolved = False
+        floor_changed = len(stated_floors) == 1 and session.confirmed_floor not in (None, stated_floors[0])
+        floor_selected = len(stated_floors) == 1 and session.confirmed_floor != stated_floors[0]
         if len(stated_floors) == 1:
-            floor = stated_floors[0]
-            if session.confirmed_floor is not None and floor != session.confirmed_floor:
-                session.posterior = locator.uniform_room_prior(building.candidate_room, len(building.rooms))
-                session.covered.clear()
-                session.evidence_messages = 0
-            session.confirmed_floor = floor
+            session.confirmed_floor = stated_floors[0]
         room_types = questions.room_types_mentioned(text) | set(cues.room_types if cues else ())
         denied = questions.room_types_denied(text) - room_types  # "I'm not in the garage"
         scores, boost = await asyncio.to_thread(self._evidence, loaded, text, reply, reading.explained, room_types,
                                                 reading.covered, denied)
-        if scores is not None:
-            session.posterior = locator.update(session.posterior, scores, boost, candidate_room=building.candidate_room)
-        if reading.likelihood is not None:
-            session.posterior = locator.apply_likelihood(session.posterior, reading.likelihood)
-        if reading.position is not None:
-            session.posterior = locator.apply_within_rooms(session.posterior, reading.position, building.candidate_room)
-        if scores is not None or reading.likelihood is not None:
-            session.evidence_messages += normalized not in session.evidence_texts or session.pending is not None
-            if session.pending is None:
-                session.evidence_texts.add(normalized)
-            session.posterior = locator.apply_floor(session.posterior, building.candidate_room, len(building.rooms))
-        if session.confirmed_floor is not None:
-            allowed = building.candidate_floor == session.confirmed_floor
-            constrained = np.where(allowed, session.posterior, 0)
-            if constrained.sum() == 0:
-                constrained = np.where(allowed, locator.uniform_room_prior(building.candidate_room, len(building.rooms)), 0)
-            session.posterior = constrained / constrained.sum()
+        topics = (reading.covered - {"floor"}) | {f"room:{room}" for room in room_types | denied}
+        key = f"{session.pending.key if session.pending else ''}:{normalized}"
+        entries = session.ledger
+        if floor_changed:
+            entries = [entry for entry in entries if entry.topics]
+        elif questions.is_correction(text) and topics:
+            entries = [entry for entry in entries if not (entry.topics & topics)]
+        duplicate = any(entry.key == key for entry in entries)
+        if not duplicate and any(value is not None for value in (scores, reading.likelihood, reading.position)):
+            entries = [*entries, Evidence(frozenset(topics), key, scores, boost, reading.likelihood, reading.position)]
+        if duplicate:
+            session.messages.append({"role": "system", "text": "This evidence was already counted.", "ts": time.time()})
+        if entries is not session.ledger or floor_selected:
+            prior = locator.uniform_room_prior(building.candidate_room, len(building.rooms))
+            allowed = (building.candidate_floor == session.confirmed_floor
+                       if session.confirmed_floor is not None else np.ones(len(prior), dtype=bool))
+            prior = np.where(allowed, prior, 0)
+            prior /= prior.sum()
+            posterior = prior.copy()
+            for entry in entries:
+                if entry.scores is not None:
+                    posterior = locator.update(posterior, entry.scores, entry.boost, candidate_room=building.candidate_room)
+                if entry.room is not None:
+                    posterior = locator.apply_likelihood(posterior, entry.room)
+                if entry.position is not None:
+                    posterior = locator.apply_within_rooms(posterior, entry.position, building.candidate_room)
+                if entry.scores is not None or entry.room is not None:
+                    posterior = (1 - config.POSTERIOR_FLOOR) * posterior + config.POSTERIOR_FLOOR * prior
+            session.posterior = posterior
+            session.ledger = entries
+            session.evidence_messages = sum(entry.scores is not None or entry.room is not None for entry in entries)
+            session.evidence_texts.add(normalized)
         hints = self._room_hints(session, loaded, text, reply, cues, semantic, room_types)
         session.covered |= reading.covered
         last_kind = session.pending.kind if session.pending else None
@@ -310,7 +384,7 @@ class SessionManager:
         self._log_evidence(session, loaded, text, before)
         located, _ = self._located(session, loaded, hints)
 
-        if located and self._floor_settled(session, loaded):
+        if located and not session.floor_unresolved and self._floor_settled(session, loaded):
             within = self._within_room_plan(session, loaded)
             if within is not None:  # room found, but it is big: ask which part of it before "located"
                 session.within_room_asked += 1
@@ -333,6 +407,12 @@ class SessionManager:
             if len(building.floors) > 1:  # "Kitchen, Floor 2": the floor matters as much as the room upstairs
                 room = f"{room}, {building.floors[int(building.room_floor[session.estimate.room])]['label']}"
             await self._say(session, questions.LOCATED_MESSAGE.format(room=room))
+            return
+        if session.floor_unresolved and not session.floor_retry_used and loaded.features.floor_options:
+            session.floor_retry_used = True
+            options = loaded.features.floor_options
+            plan = followups.Plan("choice", "floor", "Please confirm your current floor. " + followups.floor_question(options), options=options)
+            await self._ask(session, plan, reading, "Confirming the caller’s floor.", use_llm=False)
             return
         plan = None
         if len(session.asked) < config.MAX_QUESTIONS:
@@ -480,6 +560,7 @@ class SessionManager:
                   time.time())
         session.evidence.append({
             "ts": ts, "text": text,
+            "message_id": next((m.get("id") for m in reversed(session.messages) if m["role"] == "caller" and m["ts"] == ts), None),
             "note": "This reply did not change the leading room probabilities." if not len(order) else None, "top_before": building.rooms[int(np.argmax(before))]["name"],
             "changes": [{"name": building.rooms[i]["name"], "delta": round(float(delta[i]), 3)} for i in order],
         })
@@ -560,7 +641,7 @@ class SessionManager:
 
     def snapshot(self, session: Session) -> dict:
         data = {
-            "id": session.id, "channel": session.channel, "revision": session.revision, "phone": session.phone, "address": session.address, "created": session.created,
+            "id": session.id, "channel": session.channel, "revision": session.revision, "ended": session.ended, "phone": session.phone, "address": session.address, "created": session.created,
             "status": session.status, "status_detail": session.status_detail, "model_id": session.model_id,
             "match": session.match,
             "orientation": bool(session.model_id) and orientation.path(session.model_id).exists(),

@@ -20,6 +20,7 @@ class VoiceError(ValueError):
 class VoiceCall:
     session: "Session"
     delivered: int = 0
+    offered: int = 0
     loading_deadline: float = field(default_factory=lambda: time.monotonic() + 60)
     replies: dict[int, tuple[str, dict]] = field(default_factory=dict)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -88,9 +89,9 @@ class VoiceBridge:
         # A retry returns the opening again but never starts another session.
         return {"session_id": call.session.id, "status": call.session.status, "pending": False,
                 "say": spoken_message(call.session.messages[0]["text"]),
-                "instruction": "Ask this question. If the caller already described the room, submit that answer now."}
+                "response_id": 0, "instruction": "Ask this question. If the caller already described the room, submit that answer now."}
 
-    async def reply(self, conversation_id: str, history: str) -> dict:
+    async def reply(self, conversation_id: str, history: str, acknowledge: int | None = None) -> dict:
         users = caller_messages(history)
         turn, text = len(users), users[-1]
         call = self._call(conversation_id)
@@ -102,7 +103,7 @@ class VoiceBridge:
                 if previous_text != text:
                     raise VoiceError("A processed transcript turn cannot be changed.", 409)
                 if response["pending"] and call.session.ready.is_set():
-                    response = await self._result(call)
+                    response = await self._result(call, acknowledge)
                     call.replies[turn] = (text, response)
                 return response
             if call.replies and turn < max(call.replies):
@@ -112,21 +113,34 @@ class VoiceBridge:
             call.delivered = max(call.delivered, 1)
             previous = max(call.replies, default=turn - 1)
             await self.manager.handle_reply(call.session, " ".join(users[previous:]))
-            response = await self._result(call)
+            response = await self._result(call, acknowledge)
             call.replies[turn] = (text, response)
             return response
 
-    async def status(self, conversation_id: str) -> dict:
+    async def status(self, conversation_id: str, acknowledge: int | None = None) -> dict:
         call = self._call(conversation_id)
         async with call.lock:
-            return await self._result(call)
+            return await self._result(call, acknowledge)
 
-    async def _result(self, call: VoiceCall) -> dict:
+    async def end(self, conversation_id: str, reason: str) -> None:
+        call = self.calls.get(conversation_id)
+        if call is not None:
+            await self.manager.end_call(call.session, reason)
+
+    async def _result(self, call: VoiceCall, acknowledge: int | None = None) -> dict:
         session = call.session
+        if acknowledge is not None:
+            if acknowledge > call.offered:
+                raise VoiceError("Unknown response cursor.", 409)
+            call.delivered = max(call.delivered, acknowledge)
+        if getattr(session, "ended", False):
+            return {"session_id": session.id, "status": session.status, "pending": False,
+                    "say": "The location interview has ended.", "response_id": call.offered}
         try:
             await asyncio.wait_for(session.ready.wait(), timeout=self.wait_seconds)
         except TimeoutError:
             if time.monotonic() >= call.loading_deadline:
+                await self.manager.end_call(session, "Voice interview timed out while loading the building.")
                 return {"session_id": session.id, "status": "error", "pending": False,
                         "say": "The building took too long to load.", "awaiting_answer": False}
             return {"session_id": session.id, "status": "loading", "pending": True,
@@ -134,10 +148,12 @@ class VoiceBridge:
                     "instruction": "Call location_status again. Do not resubmit the caller's answer."}
         messages = [spoken_message(m["text"]) for m in session.messages[call.delivered:]
                     if m["role"] == "dispatch"]
-        call.delivered = len(session.messages)
+        call.offered = len(session.messages)
+        if acknowledge is None:
+            call.delivered = call.offered
         if session.status == "error":
             messages = ["The demo could not process the building. Please check the dispatcher dashboard."]
         return {"session_id": session.id, "status": session.status, "pending": False,
                 "say": " ".join(messages) or "Thank you. The demo has recorded your answer.",
-                "awaiting_answer": session.pending is not None,
+                "awaiting_answer": session.pending is not None, "response_id": call.offered,
                 "instruction": "Say the returned text exactly. Accept corrections; do not invent another question."}

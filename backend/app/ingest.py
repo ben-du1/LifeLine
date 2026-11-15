@@ -11,6 +11,8 @@ Output layout:
 
 import argparse
 import json
+import re
+from tempfile import TemporaryDirectory
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -29,16 +31,41 @@ SCHEMA_VERSION = 3
 
 
 def building_dir(model_id: str) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", model_id):
+        raise ValueError("Invalid Matterport model ID")
     return config.BUILDINGS_DIR / model_id
 
 
 def is_ingested(model_id: str) -> bool:
     """True if the cache is complete and current. Older single-floor caches (no schema) are re-ingested; their
     downloaded images are reused because _download skips files that already exist."""
-    d = building_dir(model_id)
-    if not ((d / "building.json").exists() and (d / "embeddings.npz").exists()):
+    return _valid_cache(building_dir(model_id))
+
+
+def _valid_cache(directory: Path) -> bool:
+    try:
+        data = json.loads((directory / "building.json").read_text(encoding="utf-8"))
+        if data.get("schema") != SCHEMA_VERSION or not data["rooms"] or not data["floors"]:
+            return False
+        owners = []
+        room_ids = {room["id"] for room in data["rooms"]}
+        if not data["candidates"]:
+            return False
+        for index, candidate in enumerate(data["candidates"]):
+            if candidate["room_id"] not in room_ids:
+                return False
+            for rel in candidate["views"]:
+                if not (directory / rel).is_file():
+                    return False
+                owners.append(index)
+        if any(not (directory / plan["file"]).is_file() for plan in data["floorplans"].values()):
+            return False
+        with np.load(directory / "embeddings.npz") as arrays:
+            vectors = arrays["view_embeddings"]
+            return (vectors.ndim == 2 and vectors.shape[0] == len(owners)
+                    and np.isfinite(vectors).all() and np.array_equal(arrays["view_candidate"], owners))
+    except (OSError, ValueError, TypeError, KeyError, EOFError):
         return False
-    return json.loads((d / "building.json").read_text(encoding="utf-8")).get("schema") == SCHEMA_VERSION
 
 
 def _download(url: str, dest: Path) -> None:
@@ -128,7 +155,7 @@ def _pick_floorplan(floorplans: list[dict], floor_id: str) -> dict | None:
     return on_floor[0] if on_floor else None
 
 
-def download_building(model_id: str) -> dict:
+def download_building(model_id: str, *, destination: Path | None = None) -> dict:
     model = matterport.fetch_model(model_id)
     if model is None:
         raise UnusableModel(f"model {model_id} not found")
@@ -136,7 +163,7 @@ def download_building(model_id: str) -> dict:
     if not floors:
         raise UnusableModel("model has no floors")
     floor_of = {f["id"]: i for i, f in enumerate(floors)}
-    out = building_dir(model_id)
+    out = destination or building_dir(model_id)
     (out / "views").mkdir(parents=True, exist_ok=True)
 
     # Rooms that contain at least one sweep with a full skybox (photographed from inside).
@@ -229,10 +256,10 @@ def download_building(model_id: str) -> dict:
     return building
 
 
-def embed_building(model_id: str) -> None:
+def embed_building(model_id: str, *, destination: Path | None = None) -> None:
     from . import embeddings  # imported lazily: loading torch is slow and not needed for downloads
 
-    out = building_dir(model_id)
+    out = destination or building_dir(model_id)
     building = json.loads((out / "building.json").read_text(encoding="utf-8"))
     paths, owners = [], []
     for index, candidate in enumerate(building["candidates"]):
@@ -244,9 +271,26 @@ def embed_building(model_id: str) -> None:
 
 
 def ingest(model_id: str, embed: bool = True) -> None:
-    download_building(model_id)
-    if embed:
-        embed_building(model_id)
+    target = building_dir(model_id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix=f".{model_id}-", dir=target.parent) as temp:
+        staged = Path(temp) / "new"
+        previous = Path(temp) / "previous"
+        download_building(model_id, destination=staged)
+        if embed:
+            embed_building(model_id, destination=staged)
+            if not _valid_cache(staged):
+                raise UnusableModel("Downloaded building cache did not validate")
+        elif _valid_cache(target):
+            return
+        if target.exists():
+            target.rename(previous)
+        try:
+            staged.rename(target)
+        except OSError:
+            if previous.exists() and not target.exists():
+                previous.rename(target)
+            raise
 
 
 def main() -> None:

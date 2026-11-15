@@ -161,6 +161,7 @@ def write_building(spec: Spec, base: Path) -> Path:
     """building.json + embeddings.npz in the shape ingest.py writes them."""
     out = base / spec.model_id
     out.mkdir(parents=True, exist_ok=True)
+    (out / "views").mkdir(exist_ok=True)
     rooms, candidates, vectors, owners = [], [], [], []
     for r_index, room in enumerate(spec.rooms):
         x0, y0, x1, y1 = room.box
@@ -173,6 +174,7 @@ def write_building(spec: Spec, base: Path) -> Path:
             pid = f"{rid}s{s_index}"
             views = [f"views/{pid}_{face}.jpg" for face in range(1, len(sweep.views) + 1)]
             for view, concepts in zip(views, sweep.views):
+                (out / view).touch()
                 vectors.append(vector(concepts, f"{spec.model_id}/{view}"))
                 owners.append(len(candidates))
             candidates.append({"id": pid, "room_id": rid, "x": sweep.x, "y": sweep.y, "views": views})

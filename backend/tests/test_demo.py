@@ -18,7 +18,8 @@ def demo_cache(tmp_path, monkeypatch):
     cached.mkdir(parents=True)
     (cached / "building.json").write_text(json.dumps({
         "schema": ingest.SCHEMA_VERSION, "id": "CACHED01", "name": "12 Test Ln",
-        "address": "12 Test Ln, Houston, TX", "floors": [], "floorplans": {}, "rooms": [], "candidates": [],
+        "address": "12 Test Ln, Houston, TX", "floors": [{"id": "f0"}], "floorplans": {}, "rooms": [{"id": "r0"}],
+        "candidates": [{"room_id": "r0", "views": []}],
     }), encoding="utf-8")
     np.savez(cached / "embeddings.npz", view_embeddings=np.zeros((0, 4)), view_candidate=np.zeros(0, dtype=np.int32))
     monkeypatch.setattr(config, "BUILDINGS_DIR", buildings)

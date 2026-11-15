@@ -105,3 +105,5 @@ Sources:
 - https://elevenlabs.io/docs/eleven-agents/customization/tools/webhook-tools
 - https://elevenlabs.io/docs/eleven-agents/customization/personalization/dynamic-variables
 - https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/
+
+Configure the ElevenLabs post-call transcription webhook at `/api/voice/post-call` on the voice gateway public URL. Set `ELEVENLABS_POST_CALL_SECRET` in the backend environment to the webhook signing secret, then restart the backend. Audio delivery is optional and should be left off for the demo.

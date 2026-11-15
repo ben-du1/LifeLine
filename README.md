@@ -9,31 +9,30 @@ Built for the CoStar × Matterport track ("Inside and Out: AI for the Built Worl
 |---|---|
 | Core loop (call → texts → room estimate → dot on plan), simulated caller | Working, verified |
 | Address → Matterport model (fuzzy matching) | Working, verified against the live API |
-| Follow-up questions (cues, information gain, paraphrase matching) | Working; scripted eval 14/19 top room, 0 confidently wrong |
+| Follow-up questions (cues, information gain, paraphrase matching) | Working; scripted eval 15/19, no confidently wrong rooms |
 | Room photos per call (API + dashboard gallery) | Working, verified |
-| Spot within the room ("what's closest to you?", uncertainty circle) | Working: mean error 3.1 m → 1.0 m on three photo-checked spots; verified in the browser |
 | Photon iMessage (send + receive) | Working, verified with a real phone |
-| Photon + ElevenLabs voice | Voice transport and agent setup added; transport tests pass. Live calls need an eligible Photon voice line, running backend, and HTTPS tunnel. See [voice setup](voice/README.md). |
 | Orientation: north-up plan + nearest street (OpenStreetMap) | Working, verified on two houses |
 | Multi-floor buildings | Working, verified: eval 4/4 rooms and floors. In the browser, the floor tabs follow the estimate and the plan switches floors after the caller's answer. |
 | Optional Claude layer (`llm.py`) | Written and unit-tested with a stub; **never run live** (no key) |
+| Where inside a big room (`subroom.py`: region + zone label, up to 2 within-room questions) | Unit-tested on a synthetic building; within-room questions wait for `followups.choose_within_room`; not run on a real model |
+| Demo preflight (`scripts/preflight_demo.py`) + "Demo buildings" menu (`/api/demo`) | Written; unit-tested on a synthetic cache and dry-run with stubs. **Not yet run against the live API** |
 | Vexcel aerial overlay | Tried and removed (see "Orientation"). CoStar data: not used. |
+| Map view data: GeoJSON rooms + Vexcel aerial photo (`geo.py`) | Written and tested with mocked Matterport/Vexcel; **never run live** |
 
 ## Problem
 
 When people are trapped or lost inside a building during an emergency, they often cannot find the exit and must
 rely on first responders to reach them. Responders usually know the building's address, but not where inside the
-building the caller is. This tool helps a dispatcher find a caller's position on a floorplan, using a short
-text or voice conversation with the caller.
+building the caller is. This tool helps a dispatcher find a caller's position on a floorplan, using only a short
+text conversation with the caller.
 
 ## How it works
 
-1. **A demo session starts.** For text/simulated mode, enter the caller's phone and address on the dispatcher
-   dashboard. For voice mode, call the Photon demo number; ElevenLabs asks for the address and starts the backend
-   session automatically. This is not connected to actual 911 dispatch.
+1. **911 call comes in.** The caller's phone number and address are forwarded to our program. For this MVP they are
+   entered on the dispatcher dashboard (simulated 911 input).
 2. **Two things start in parallel:**
-   - The program asks the caller to describe the room: over iMessage/simulation for text sessions, or through
-     ElevenLabs speech for voice sessions.
+   - The program texts the caller over iMessage (via Photon) and asks them to describe the room they are in.
    - The address is matched to the Matterport digital twin whose address is most similar. The match does not have
      to be exact (see "Address matching"), and approximate matches are flagged to the dispatcher. The building is
      downloaded and embedded the first time, and read from the local cache afterwards.
@@ -50,10 +49,7 @@ text or voice conversation with the caller.
      and step 4 repeats. In a multi-storey building, "Which floor are you on?" comes first while the floor is
      uncertain. It stops with a best guess, marked low-confidence, after `MAX_QUESTIONS` rounds or when no question
      would help.
-6. **Where in the room.** Once the room is known, the system asks up to two "what's closest to you?" questions, for
-   example "the stove, the sink, or the fireplace?", built from that room's scan points. The dot moves toward the
-   matching spot, with a circle showing how sure it is.
-7. **Orientation for responders.** The plan is drawn north-up, with the nearest street on the side where it really
+6. **Orientation for responders.** The plan is drawn north-up, with the nearest street on the side where it really
    is.
 
 ## MVP scope
@@ -72,7 +68,7 @@ text or voice conversation with the caller.
 - Basements: Matterport floor labels are just "Floor 1", "Floor 2", ..., so the lowest floor is treated as the
   ground floor.
 - Addresses with no Matterport model: the session is marked "no interior model" and no location is attempted.
-- Real 911 integration. Voice demos use a normal Photon phone number; dashboard input simulates dispatch.
+- Real 911 integration (call data is typed into the dashboard).
 - CoStar data (not used: the extract is property, lease and sale records, with no roads or imagery). Vexcel aerial
   imagery was integrated, then removed (see "Orientation").
 
@@ -96,7 +92,6 @@ text or voice conversation with the caller.
 | Component  | Path         | Tech                              | Responsibility |
 |------------|--------------|-----------------------------------|----------------|
 | Backend    | `backend/`   | Python 3.11, FastAPI, open_clip   | Sessions, building ingest, matching, question choice, REST + WebSocket API |
-| Voice      | `voice/`     | Node 22.9+ (tested with 24), ElevenLabs SDK | Agent provisioning and authenticated voice-only HTTP gateway (:8788) |
 | Messaging  | `messaging/` | Node 20+, `fetch` (Photon REST)   | Sends iMessages for the backend; forwards caller replies to the backend |
 | Dashboard  | `dashboard/` | React + Vite                      | Simulated 911 form, live conversation, room probabilities, floor plan with dot |
 | Cache      | `data/`      | Files on disk (gitignored)        | Building JSON, skybox images, floorplan image, embeddings |
@@ -107,7 +102,7 @@ Sessions are kept in memory in the backend (restarting the backend clears them).
 
 | Module          | Purpose |
 |-----------------|---------|
-| `config.py`     | Loads the root `.env`, paths, and tunable constants (thresholds, temperature, max questions). |
+| `config.py`     | Loads `.env`, paths, and tunable constants (thresholds, temperature, max questions). |
 | `matterport.py` | Minimal GraphQL client (HTTP Basic auth), the queries we use, model search and match ranking. |
 | `addresses.py`  | Fuzzy address similarity (street, house number, city/state/ZIP) for picking a model. |
 | `ingest.py`     | Downloads every floor's rooms (with wall outlines), sweeps, skybox faces and floorplans; computes embeddings. Also a CLI. |
@@ -115,45 +110,47 @@ Sessions are kept in memory in the backend (restarting the backend clears them).
 | `embeddings.py` | Wraps the open_clip model (image and text encoders). |
 | `locator.py`    | Pure-numpy belief update, confidence rule, and expected information gain. |
 | `followups.py`  | Reads cues from the caller's words; feature model (CLIP + room labels + geometry + floors); plans follow-ups. |
+| `adjacency.py`  | Shared walls between rooms and street-facing rooms, from the floor plan; "position" follow-ups ("next to the kitchen?"). |
+| `ties.py`       | Rooms that are tied with the leader and look alike, named together to the dispatcher. |
 | `semantics.py`  | Local paraphrase matching of caller messages (sentence embeddings). |
 | `orientation.py`| North-up heading (Matterport) and the nearest street (OpenStreetMap Nominatim) for the floor plan. |
+| `geo.py`        | Rooms, outline and sweeps in lon/lat (GeoJSON) for a map view; optional Vexcel aerial photo around the house. |
 | `llm.py`        | Optional Claude reading of replies and wording of follow-ups (falls back to keyword rules). |
 | `questions.py`  | Opening/closing messages and reply parsing (yes / no / free text / unsure). |
+| `subroom.py`    | Where inside a big room: in-room region (centroid + radius) and a zone label ("kitchen end, near the stove"). |
 | `sessions.py`   | Session state machine and conversation flow. |
 | `messaging.py`  | Outbound messages: `simulated` (dashboard only) or `photon` (via the sidecar). |
-| `voice.py`      | Voice conversation binding, original-transcript extraction, retry protection, queued results, and demo speech wording. |
-| `voice_routes.py` | Authenticated `/api/voice/start`, `/reply`, and `/status` routes. |
+| `demo.py`       | Demo building list (`demo_buildings.json`) and its cache readiness, for `/api/demo` and `scripts/preflight_demo.py`. |
 | `main.py`       | FastAPI routes, WebSocket broadcast, static files for cached building assets. |
 
 ### API
 
 | Method | Path                           | Body / notes |
 |--------|--------------------------------|--------------|
-| GET    | `/api/config`                  | `{messaging_mode, dev_test_phone, max_questions, followups}` for the dashboard |
+| GET    | `/api/config`                  | `{messaging_mode, dev_test_phone, max_questions, followups, google_maps_key, aerial}` for the dashboard, plus `google_maps_api_key` when set (a browser key) |
+| GET    | `/api/demo`                    | Demo buildings from `demo_buildings.json`, ready first: `[{address, label, note, model_id, ready, cached, orientation, match_score, problems[], score?}]`. Cache only (no network); `score` only if `compat.py` exists |
 | POST   | `/api/calls`                   | `{phone, address}`: simulated 911 call; creates a session |
 | GET    | `/api/sessions`                | All sessions (snapshots) |
 | GET    | `/api/sessions/{id}`           | One session snapshot |
 | GET    | `/api/sessions/{id}/rooms`     | Every room of the call's building, most likely first: `{index, name, types, floor, area_m2, probability, sweeps[{candidate, x, y, probability, views[url]}]}` |
 | POST   | `/api/sessions/{id}/reply`     | `{text}`: simulated caller reply from the dashboard |
-| POST   | `/api/voice/start`             | Bearer-authenticated `{conversation_id, address, phone?}`: starts a voice session |
-| POST   | `/api/voice/reply`             | Bearer-authenticated `{conversation_id, history}`: processes original transcript answer |
-| POST   | `/api/voice/status`            | Bearer-authenticated `{conversation_id}`: polls queued results |
 | POST   | `/api/inbound`                 | `{from, text}`: real caller reply, posted by the messaging sidecar |
 | WS     | `/ws`                          | Pushes `{type: "session", session}` on every change |
 | GET    | `/api/buildings/{model_id}`    | Cached `building.json` (`floors`, `floorplans` per floor, rooms with `floor`/walls/polygon/centroid, candidates) with asset URLs, plus `orientation` (`yaw_deg`, `street{name, distance_m, bearing_deg, side, direction_deg}`) once fetched |
-| GET    | `/buildings/{model_id}/...`    | Cached floorplan and view images |
+| GET    | `/api/buildings/{model_id}/geo`    | GeoJSON `FeatureCollection` of rooms (`properties{kind:"room", index, name, floor, types}`) and the building outline (`kind:"building"`), plus `center{lat, lon}`, `yaw_deg`, `candidates[{candidate, lat, lon, room, floor}]`, `bounds[[s, w], [n, e]]`. 404 if not loaded or no geolocation |
+| GET    | `/api/buildings/{model_id}/aerial` | `{url, bounds[[s, w], [n, e]], source:"Vexcel"}`, or 404 with the reason (no key, outside coverage, error) |
+| GET    | `/buildings/{model_id}/...`    | Cached floorplan, view and aerial images |
 
-Session snapshot fields: `id, phone, address, status, status_detail, model_id, channel`,
-where `channel` is `messaging` or `voice`,
+Session snapshot fields: `id, phone, address, status, status_detail, model_id`,
 `match{id, name, address, score, exact}` (the Matterport property in use), `messages[{role, text, ts}]`
 (`role` is `dispatch`, `caller` or `system`), `questions_asked, max_questions`,
-`rooms[{index, name, floor, floor_label, probability}]` (sorted), `floors[{index, label, probability}]`,
+`rooms[{index, name, floor, floor_label, probability, has_photos, types, area_m2}]` (sorted), `floors[{index, label, probability}]`,
 `orientation` (true once north/street data is cached), `candidate_probabilities[]` (aligned with the building's
-`candidates`), and `estimate{room, room_name, floor, floor_label, candidate, x, y, radius_m, room_probability,
-runner_up_probability, confident}`. In `estimate`:
-- `x, y` is the probability-weighted position of the top room's scan points.
-- `radius_m` is its uncertainty (RMS spread, at least 0.75 m).
-- `candidate` is the single most likely scan point.
+`candidates`), and `estimate{room, room_name, floor, floor_label, candidate, x, y, room_probability,
+runner_up_probability, confident}`, and `tie_group[{index, name, probability}]` (rooms that can't be told apart
+from the leading one, leader first; empty when there is no tie, see `ties.py`),
+`evidence[{ts, text, top_before, changes[{name, delta}]}]` (last 20
+caller messages: the top-3 room probability changes each caused, shown under the message on the dashboard).
 Statuses: `loading → listening → located | best_guess`, or `no_model` / `error`.
 
 ## Matterport data
@@ -243,35 +240,29 @@ model at a very similar address does exist. The backend therefore picks the mode
 - **Candidates:** one per sweep (plus one per sweep-less room). Each candidate's score for a piece of text is the
   maximum cosine similarity over its 4 views. The caller may be facing any direction.
 - **Prior:** uniform over rooms, split evenly across a room's candidates, so rooms with many sweeps are not favored.
-- **Update:** `posterior ∝ prior × exp(LOGIT_SCALE × (score − max score))`, applied once per reply. If the reply
-  names a room type, candidates in rooms with that classification are multiplied by `ROOM_KEYWORD_BOOST`.
-- **Rooms without photos** (`Building.candidate_scores`) start from the median imaged score
-  (`IMAGELESS_SCORE_QUANTILE`, roughly neutral). They are then lifted by how far photographed rooms *of the same
-  type* stand out for the text (mean peer score minus mean imaged score).
-  - **Why:** at 12331 Basilwood Dr the whole upper floor has no photos. Before this, "I'm in the bathroom" was
-    "located" in the one photographed (downstairs) bathroom at 91%, because LOGIT_SCALE turned "has a photo" into
-    ~20× odds. Now the three bathrooms tie and the floor question comes first.
-  - **Mean, not max:** the best of several peers scores high for almost any text, and in the eval that let
-    unphotographed closets and a 2 m² "bedroom" win.
-- **Within a room** (`IN_ROOM_LOGIT_SCALE = 15`): each room's total moves exactly as above, but the room's share is
-  split among its own scan points with a quarter of the sharpness.
-  - **Why:** photo-score differences between sweeps of one room are mostly noise for a room-level description.
-    "I'm in the living room" put 38% on one of eleven sweeps, and the dot started 2–5 m off.
-  - **Rejected alternative:** ranking rooms by their best sweep favoured rooms with many sweeps, and "I'm in a
-    narrow space" was "located" in the big living area instead of the hallway.
+- **Update:** `posterior ∝ prior × L`, applied once per reply (`locator.clip_likelihood`). Per room, `L` is
+  `exp(LOGIT_SCALE × (best sweep score − spread × expected max of N draws))`, where spread is the scores' robust (MAD)
+  spread and N the room's sweep count, so a room with many sweeps isn't favored for one lucky view. It is clipped so no
+  room gets more than `CLIP_MAX_LIKELIHOOD_RATIO` (4x) another's: photos alone can't locate a caller in one message.
+  Inside a room, sweeps are reweighted by `exp(LOGIT_SCALE × score)` without changing the room's total. Image-less
+  candidates borrow the score of photographed rooms that share their room type (log-mean-exp of each such room's
+  sweeps, averaged over those rooms), so a photo-less bathroom and a photographed one split "there's a toilet" evenly;
+  the follow-up model's CLIP presence is imputed the same way. With no photographed room of the same type they get
+  the median imaged score (`IMAGELESS_SCORE_QUANTILE`, roughly neutral). If the reply names a room
+  type, candidates in rooms with that classification are multiplied by `ROOM_KEYWORD_BOOST`.
 - **Free-text replies** are embedded and scored as above. A reply that only answers our question ("yes", "tile",
   "none of those") is not embedded; its meaning comes from the follow-up model below.
 - **Confidence rule:** the top room's probability ≥ `CONFIDENCE_THRESHOLD` and it leads the runner-up by at least
-  `CONFIDENCE_MARGIN`.
-- **After "located", the call keeps listening.** New replies still update the estimate:
-  - If the estimate moves to another room, or confidence drops, the call reopens and asks a follow-up.
-  - If the room stays the same, nothing is re-sent.
-  - An explicit correction ("sorry", "actually", "I meant", "no wait") resets the estimate to the prior before
-    the new reply is applied. Without the reset, one correction after a confident wrong room (98%) only brought it
-    down to ~50%.
+  `CONFIDENCE_MARGIN`. "Located" also needs (`locator.is_located`): no room of the same type with at least
+  `SIBLING_RATIO` × the leader's probability (identical bedrooms), and at least `MIN_EVIDENCE_MESSAGES` caller
+  messages that carried evidence, unless one message named the only room of its type or a feature only it has ("I'm in
+  the kitchen" in a one-kitchen house). Short only of evidence, the best follow-up is asked even if its expected gain is
+  below `MIN_INFORMATION_GAIN`.
+- **Posterior floor:** after each evidence-bearing message, `POSTERIOR_FLOOR` (2%) of the uniform-room prior is mixed
+  back in, so no room shows 0% or 100% and a later contradicting answer can still win.
 - **Output:** the highest-probability candidate inside the top room; its `(x, y)` (model meters) is drawn on the
   floor plan. The dashboard shows every photo of that room, or of any room the dispatcher clicks.
-- **Current values** (`config.py`): `LOGIT_SCALE=60`, `ROOM_KEYWORD_BOOST=20`, `IMAGELESS_SCORE_QUANTILE=0.5`,
+- **Current values** (`config.py`): `LOGIT_SCALE=60`, `CLIP_MAX_LIKELIHOOD_RATIO=4`, `ROOM_KEYWORD_BOOST=20`, `IMAGELESS_SCORE_QUANTILE=0.5`,
   `CONFIDENCE_THRESHOLD=0.6`, `CONFIDENCE_MARGIN=0.25`, `MAX_QUESTIONS=6`, `MIN_INFORMATION_GAIN=0.05`. The comments
   in `config.py` say why.
 
@@ -307,6 +298,34 @@ Both match the aerial imagery. At Pointer St, the scanned "Front Porch" sits on 
 - **OSM spelling:** street names come from OSM and can differ from the address. OSM has "Chapman Glen Drive" where
   the address says "Chipman Glen Dr".
 
+### Map view data and aerial imagery (`geo.py`)
+
+The same transform, plus a local meters-per-degree scale, puts every room, sweep and a convex-hull building outline
+in lon/lat (`/api/buildings/{id}/geo`). Matterport's raw geocoordinates are cached in
+`data/buildings/<id>/geo.json`, shared with `orientation.py`, so they cost one GraphQL call per building.
+
+With `VEXCEL_API_KEY` set, the backend also clips one Vexcel orthophoto (7.5 cm/px, `AERIAL_SIZE_M` = 110 m square,
+1400 px) around the house after orientation loads, in the background, and caches it as `aerial.jpg` +
+`aerial.json` (bounds). Hackathon keys cover Houston and Los Angeles only; elsewhere Vexcel answers 403, logged
+once, and the endpoint returns 404 with the reason. The photo is approach context (street, driveway, neighbours):
+the few-meter position error that ruled out the old plan-on-roof overlay still applies, so the rooms are not
+claimed to sit exactly on the roof.
+### Approach card (`approach.py`, `ApproachCard.jsx`)
+
+Under the plan, the dashboard says which side of the building and which floor the caller is on, in words for
+responders outside: "2nd floor, rear (north) side, away from Pointer Street. Caller's room has an outside wall on the
+north side, about 4 m from its east end."
+
+- **Outside walls:** per floor, a room's wall is shared where another room on that floor is right behind it (a
+  parallel wall within 0.45 m, the wall thickness, or a point 0.6 m outside it inside that room's outline). The rest
+  is the building outline. An interior room says so and names the nearest outside wall and its distance.
+- **Side and street:** the chosen wall's outward normal is turned into a compass bearing with the model's yaw; it is
+  "front" within 60° of the street's bearing and "rear" beyond 120°.
+- **Street View:** a keyless Google Maps link from ~18 m outside the wall, looking at it. This needs the model's
+  geolocation, cached in `geo.json` next to `orientation.json`. If `GOOGLE_MAPS_API_KEY` is set, the card also shows
+  a Street View Static image; that key is visible to the browser, so restrict it.
+- The text the caller receives is unchanged; the dispatcher's status line adds "Approach: rear (north) side, ...".
+
 ## Follow-up questions (`followups.py`)
 
 There is no fixed question list. Each follow-up builds on what the caller has said so far.
@@ -320,19 +339,43 @@ There is no fixed question list. Each follow-up builds on what the caller has sa
   - **Room names:** as before, named room types boost matching rooms.
 - **Feature model:** each feature (toilet, shelves, washer, stove, narrow shape, and so on) has a probability
   P(present | candidate), averaged from:
-  - **CLIP:** the candidate's photos against the feature prompt, z-scored and passed through a sigmoid.
+  - **CLIP:** the candidate's photos against 3 phrasings of the feature, minus neutral prompts ("an empty room",
+    "a white wall", ...) in the same view, best view per candidate, through a fixed logistic and nudged by the
+    old z-score rank. A feature absent from the whole building now reads as absent everywhere. Constants in
+    `config.py` (`CLIP_CONTRAST_*`) are reasoned, not yet measured on real CLIP; `CLIP_CALIBRATED=0` reverts.
   - **Room label:** Matterport's classification or label, counted double. A toilet implies a bathroom, which lets
     rooms *without photos* be found.
   - **Geometry:** floor area for size questions; bounding-box aspect ratio for "long and narrow".
+  - **Commonsense guard** (`commonsense.py`): a room-type × feature table (typical / possible / implausible) bounds
+    the result, so CLIP can't put a toilet in a garage or a bed in a kitchen (implausible ≤ 0.08, typical ≥ 0.6;
+    also carpet in a garage, a "bigger" closet). Unrecognised room labels ("Room 1") get no bounds.
 - **Question kinds:**
   - **Yes/no:** "Is there a washing machine or dryer?"
-  - **Choice:** "What is the floor like: carpet, tile, or wood?" and "About how big is the room: closet-sized,
-    bedroom-sized, or bigger?" (answered from geometry).
+  - **Choice:** "What is the floor like: carpet, tile, wood, or concrete?" and "About how big is the room:
+    closet-sized, bedroom-sized, or bigger?" (answered from geometry). For flooring, a room type that rules a
+    material out (carpet in a garage, bathroom, kitchen or laundry) overrides CLIP, which confuses grey concrete with
+    carpet. Floor materials named unprompted ("carpeted floor") count as the same answer, and a message that is only
+    a floor description skips the free-text CLIP match.
   - **Which of these:** a list built from the three features that best separate the rooms still in play, e.g.
     "What can you see around you: shelves or hanging clothes, a washer or dryer, or a toilet, tub or shower?"
 - **Choosing:** the question with the highest expected information gain about the *room*
   (`locator.expected_information_gain`) is asked. Topics the caller already settled (mentioned, answered, or
   "I don't know") are never asked again. A "which of these" list is not asked twice in a row.
+- **Position questions (`adjacency.py`):** when the remaining rooms look alike, i.e. no content question is worth
+  `POSITION_ONLY_BELOW_GAIN` (0.15 bits), questions about *where* the room is join the candidates:
+  - **"Is the room you're in next to the kitchen, sharing a wall or a doorway?"**: two rooms on a floor are neighbours
+    when their outlines run parallel within `ADJACENCY_WALL_GAP_M` (0.4 m) for at least `ADJACENCY_MIN_SHARED_M`
+    (0.5 m). Only rooms with a name that is unique in the building are used as the reference ("the kitchen", never
+    "Bedroom 2").
+  - **"Is the room at the front of the house, on the <street> side?"**: once orientation is known, the street's
+    bearing is rotated into model meters; a room is at the front if part of its street-facing outline has no room in
+    front of it (ray cast) and is within `FRONT_MAX_SETBACK_M` (3 m) of the house's street-side edge.
+  - Answers are soft, 0.85 / 0.15 like the room-label prior. Unit-tested on synthetic houses only; not yet run on a
+    real model's walls.
+- **Ties (`ties.py`):** a room is tied with the leader when it is at least half as likely and has the same room type
+  or a near-identical feature profile, and the tied rooms hold at least half the belief. The best-guess (or located)
+  detail then reads "Bathroom 1 or Bathroom 2 (58% / 42%), can't tell apart yet", and a system note tells the
+  dispatcher to check each. The caller's message is unchanged.
 - **Stopping:** if no question is worth `MIN_INFORMATION_GAIN` (0.05 bits), the call stops with a best guess that
   lists the leading rooms, instead of asking irrelevant questions.
 - **Floors (multi-storey buildings):**
@@ -345,34 +388,6 @@ There is no fixed question list. Each follow-up builds on what the caller has sa
     the floor first, and callers know it.
   - **Located needs the floor too:** "located" also requires the room's floor to be that likely, so "I'm in the
     kitchen" in a building with two kitchens on different floors asks for the floor before declaring a location.
-- **Where in the room** (`followups.refinement`): once the room is "located", the system asks up to
-  `MAX_REFINEMENTS = 2` "what's closest to you?" questions. The conditions:
-  - the room has several photographed scan points;
-  - the position is spread more than `REFINE_MIN_SPREAD_M = 1.5 m`;
-  - the question is worth at least `REFINE_MIN_GAIN = 0.15` bits.
-
-  The first one is appended to the "located" text. How it works:
-  - **Landmarks:** stove, sink, fridge, fireplace, front door, glass door, couch, table, TV, bed, toilet, stairs,
-    and so on, limited to those the room probably has. Each scan point gets a close-up CLIP score
-    ("a close-up photo of the stove"), z-scored across the room's scan points. In the sample house, kitchen items
-    peak at the sweep between the sink, stove and fridge, and the fireplace at the sweep beside it (checked
-    against the photos).
-  - **Choosing the three landmarks:** every combination is scored, and the one with the highest expected
-    information gain over the scan points is asked. Ranking landmarks one at a time picked weak sets (0.13 vs
-    0.65 bits).
-  - **Reading the answer:** each landmark is modelled independently as "right next to you" (`NEAR_SCALE = 1.5`),
-    so naming one, several, or "none of those" are all evidence.
-  - **No effect on the room:** the answer is applied with `locator.apply_within_rooms`, which keeps every room's
-    total. It only moves the dot.
-
-  Results for callers at three photo-checked spots in the sample house's main room, each opening with "I'm in the
-  living room":
-
-  | Spot | Answers | Error before → after | Uncertainty |
-  |---|---|---|---|
-  | By the sink/stove/fridge | "none of those"; "the stove and the sink" | 1.6 m → 0.6 m | ±3.0 → ±1.4 m |
-  | By the fireplace and patio door | "the glass door to outside"; "the fireplace" | 3.7 m → 1.0 m | ±3.0 → ±2.0 m |
-  | By the front door and table | "the table"; "the front door" | 4.0 m → 1.5 m | ±3.0 → ±2.6 m |
 - **Phrasing:** each question starts by acknowledging the last cue: "You said it's a tight space. Can you see a
   sink or faucet?"
 
@@ -414,35 +429,34 @@ against the live API**: no Claude credentials were available. Expect a few secon
 
 `backend/scripts/eval_scenarios.py [-v]` runs scripted callers through the real session flow. Their answers come
 from a fact sheet checked against the photos, and `-v` prints each conversation. Current result, with no API key:
-**14/19 top room correct, and none confidently wrong**:
-- 10/15 on the single-floor houses, including 3 of 4 open-ended paraphrases that contain no feature keywords.
+**15/19**:
+- 11/15 on the single-floor houses, including 3 of 4 open-ended paraphrases that contain no feature keywords.
 - **4/4 rooms and 4/4 floors** on the 4-floor building.
-
-Before the "rooms without photos" fix the score was 15/19, but two of the misses were declared "located" in the
-wrong room. Those cases had won only because their closet was the one with a photo. They now end as an honest best
-guess that lists the similar closets.
+- Since the Nov 14 reliability changes (re-run on the real API that day): all 4 misses end as a best guess naming
+  the candidates; none is a confidently wrong "located" (the earlier code located Closet 4 and Closet 2 wrongly).
+  More calls take 4-6 follow-ups before deciding. The per-scenario table below predates these changes.
 
 It needs the three buildings cached; it ingests them on first run, which takes several minutes.
 
 | Building | Caller is in | Opening | Result |
 |---|---|---|---|
-| Chipman Glen (vacant) | Bedroom 1 | "empty room with a window and a ceiling fan" | Correct (best guess, 53%) |
+| Chipman Glen (vacant) | Bedroom 1 | "empty room with a window and a ceiling fan" | Correct, no follow-ups |
 | Chipman Glen | Bedroom 2 | "empty room with two windows with blinds" | Best guess: Bedroom 3 55%, Bedroom 2 31% (identical empty rooms) |
 | Chipman Glen | Kitchen/living | "I can see a stove and a fridge" | Correct, no follow-ups |
 | Chipman Glen | Kitchen/living | "there's a brick fireplace" | Correct, no follow-ups |
 | Chipman Glen | Bathroom 1 | "I'm in a cramped space" | Best guess: Bathroom 2 58%, Bathroom 1 42% (neither has photos) |
 | Chipman Glen | Hallway | "I'm in a narrow space" | Correct after 3 follow-ups |
-| 7921 Pointer St | Pantry/Laundry | "small room with lots of shelves" | **Wrong:** best guess lists the closets (~33% each). Labeled laundry, but there is no machine, so a truthful "no washer" counts against it |
-| 7921 Pointer St | Closet 4 | "I'm in a cramped space" | **Wrong:** best guess, Closet 4 third (22%) behind two unphotographed closets the caller can't be told apart from |
+| 7921 Pointer St | Pantry/Laundry | "small room with lots of shelves" | **Wrong:** Closet 4. Labeled laundry, but there is no machine, so a truthful "no washer" counts against it |
+| 7921 Pointer St | Closet 4 | "I'm in a cramped space" | Correct (best guess, 35%) |
 | 7921 Pointer St | Bathroom | "it's tiny in here" | Correct after 3 follow-ups |
 | 7921 Pointer St | Kitchen | "I'm next to the stove" | Correct, no follow-ups |
 | 7921 Pointer St | Bedroom 3 | "it's a big room with a bed" | Correct after 1 follow-up |
 | 7921 Pointer St | Kitchen | "I'm right next to where you cook" | Correct, no follow-ups |
 | 7921 Pointer St | Bathroom | "I can barely move, I'm squeezed in by the tub" | Correct after 4 follow-ups |
 | Chipman Glen | Kitchen/living | "the room is massive, there's a brick mantel" | Correct, no follow-ups |
-| 7921 Pointer St | Closet 4 | "I can touch both walls and my coats are hanging next to me" | **Wrong:** best guess across four closets (Closet 2 28%). Read correctly as a tight closet; a truthful "no window" counts against Closet 4, whose photo shows the bedroom window through its door |
+| 7921 Pointer St | Closet 4 | "I can touch both walls and my coats are hanging next to me" | **Wrong:** Closet 2. Read correctly as a tight closet, but a truthful "no window" counts against Closet 4, whose photo shows the bedroom window through its door |
 | 3012 Houston Ave (4 floors) | Office, floor 1 | "I'm downstairs in a room with wood paneling and a bookcase" | Correct, floor 1 at 97%, no follow-ups |
-| 3012 Houston Ave | Game Room, floor 3 | "I'm in an empty room with built-in shelves" | Asked the floor ("3rd floor"), then correct after more follow-ups |
+| 3012 Houston Ave | Game Room, floor 3 | "I'm in an empty room with built-in shelves" | Asked the floor ("3rd floor"), then correct |
 | 3012 Houston Ave | Loft, floor 4 | "I'm on the top floor near the stairs, there's a couch" | Correct, floor 4 at 93%, no follow-ups |
 | 3012 Houston Ave | Kitchen, floor 1 (another on floor 2) | "I'm in the kitchen" | Asked the floor ("ground floor"), then correct |
 
@@ -472,163 +486,9 @@ of picking one confidently.
   - the locator updated its estimate and asked the next question each time.
 - `MESSAGING_MODE=simulated` (default) skips the sidecar entirely; `MESSAGING_MODE=photon` sends via the sidecar.
 
-## Voice calling (Photon + ElevenLabs)
-
-The calling path is separate from the iMessage sidecar:
-
-```text
-Personal phone -> Photon demo number -> SIP/TLS -> ElevenLabs agent
-                                                   |
-                                          authenticated HTTPS tools
-                                                   |
-                                           Cloudflare Tunnel
-                                                   |
-                                      voice/gateway.mjs (:8788)
-                                                   |
-                                   FastAPI /api/voice/* (:8000)
-                                                   |
-                                    existing SessionManager
-                                                   |
-                           parsing / semantics / follow-ups / locator
-                                                   |
-                            spoken answer via ElevenLabs + Photon
-
-Dispatcher dashboard (:5173) <- existing WebSocket updates from FastAPI
-```
-
-ElevenLabs handles speech recognition, conversation orchestration, and speech synthesis. It
-sends the original conversation transcript to the backend; the backend selects the questions
-and estimates the room, floor, and position. It continues accepting corrections after an
-initial location estimate. Voice sessions use `channel="voice"`, skip iMessage sending, and
-are excluded from the iMessage phone-number lookup.
-
-The generated agent is **HackPrinceton Photon Room Locator**:
-[agent editor](https://elevenlabs.io/app/agents/agents/agent_2201m7dz61kvfmbasg1ey39zjnks).
-Its setup currently selects Gemini 2.5 Flash, the Sarah voice, and `eleven_flash_v2` TTS.
-No additional cost/token optimization has been implemented or measured.
-
-### Voice tools and gateway
-
-| ElevenLabs tool | Backend endpoint | Purpose |
-|---|---|---|
-| `start_location` | `POST /api/voice/start` | Creates a voice session from the caller's address and phone, bound to the platform conversation ID |
-| `submit_location_answer` | `POST /api/voice/reply` | Passes the latest original caller answer through the existing session pipeline |
-| `location_status` | `POST /api/voice/status` | Polls for the result of a queued answer while the building loads |
-
-The start body is `{conversation_id, address, phone?}`; reply takes
-`{conversation_id, history}`, where `history` is ElevenLabs' JSON-serialized transcript;
-status takes `{conversation_id}`. Responses include `session_id`, `status`, `pending`,
-`say`, and instructions for the agent. The platform injects conversation identity, caller
-number, and history through system dynamic variables rather than asking the LLM to invent them.
-
-Both the backend routes and gateway require `Authorization: Bearer <VOICE_TOOL_TOKEN>`.
-The gateway exposes only those three POST routes, limits request size, and rejects dispatcher
-APIs, building assets, and WebSockets. The agent references a stored ElevenLabs workspace secret.
-Requests are serialized per voice conversation; replayed transcript turns reuse the existing
-result so retries do not update the locator twice. The same answer on a later turn is still
-processed. If a reply is queued while loading, the agent polls status rather than resubmitting it.
-
-`voice/setup.mjs` uses the ElevenLabs SDK to create the agent, or update the agent identified
-by `ELEVENLABS_AGENT_ID`. It saves generated identifiers, the gateway token, and tunnel URL
-in the root `.env`. Setup does not place calls or generate an audio test.
-
-### Connect a demo phone number
-
-Use a separate, eligible Photon number as the number people call. A personal phone can call
-that demo number; `DEV_TEST_PHONE` is not how the Photon number is assigned. Shared iMessage
-assignments cannot receive voice calls. Acquire an eligible SMS number or dedicated messaging
-line in Photon, or ask the Photon team to provision a voice-capable number.
-
-For an **incoming-only** demo:
-
-1. In Photon **Voice**, create/select a SIP profile for the eligible number.
-2. In ElevenLabs **Deploy > Phone Numbers > Import number > From SIP Trunk**, enter the
-   **Photon number** in international format. Set inbound media encryption to **Allowed**.
-   Leave outbound calling disabled; an outbound SIP password is not required for this path.
-3. Open the imported number and assign **HackPrinceton Photon Room Locator** and the intended
-   published branch/version.
-4. In Photon inbound settings, set destination `sips:sip.rtc.elevenlabs.io:5061`, transport
-   **TLS**, and media encryption **Auto**. If inbound SIP authentication is enabled in
-   ElevenLabs, enter that same inbound credential pair in Photon.
-5. Call the Photon demo number from a separate phone. Confirm the agent hears you, speaks
-   replies, and the dispatcher dashboard receives the resulting session.
-
-The phone number is imported at ElevenLabs' **Phone Numbers** page, then assigned to the agent;
-it is not entered into the agent prompt or `DEV_TEST_PHONE`. Phone routing and backend HTTPS
-tool routing are separate connections: both must work for the full demo.
-
-References: [Photon incoming-call setup](https://photon.codes/docs/beta/get-started/voice)
-and [incoming/outgoing SIP cookbook](https://photon.codes/docs/beta/cookbooks/voice/elevenlabs).
-
-### Start voice mode
-
-Use the root `.env` for all credentials. Run the backend and dashboard using the Setup
-commands below. Do not run the iMessage sidecar just for voice mode; `MESSAGING_MODE`
-controls text sessions, while voice sessions choose their own transport.
-
-In a new PowerShell terminal:
-
-```powershell
-cd C:\Users\Joshua\Projects\hackprinceton-mvp\voice
-$env:NODE_OPTIONS='--use-system-ca'
-npm install
-npm start
-```
-
-The gateway listens on `127.0.0.1:8788` and forwards to `BACKEND_URL` (default
-`http://localhost:8000`). In another terminal, run:
-
-```powershell
-cloudflared tunnel --url http://127.0.0.1:8788 --no-autoupdate
-```
-
-If `cloudflared` is not on PATH, a temporary copy was downloaded during setup to
-`C:\Users\Joshua\AppData\Local\Temp\elevenlabs-skills-hJr7VU\cloudflared.exe`.
-Invoke that executable directly or install Cloudflare Tunnel normally.
-
-Copy the generated HTTPS URL, then configure the agent from the `voice` folder:
-
-```powershell
-npm run setup -- https://YOUR-HOST.trycloudflare.com
-```
-
-The helper updates the saved agent rather than creating another one. Restart the backend
-and gateway after setup if they were already running, so both read the saved token.
-Keep the backend, gateway, and tunnel running throughout the demo. The dashboard server
-must also run if the dispatcher should see live results. Quick Tunnel URLs change on restart:
-run setup again with the new URL. Do not tunnel directly to the unrestricted backend.
-
-### Voice verification and limits
-
-The real ElevenLabs agent was created and its saved model, tool URLs, and dynamic-variable
-bindings were read back successfully. The onboarding check verified the key and SDK integration.
-**An end-to-end Photon phone call has not been verified in this development session.**
-
-Eight Python voice checks and one Node gateway check passed. The pipeline tests exercised the
-existing parser/planner, semantic-cue routing, floor selection, and a correction from an
-upstairs estimate to the downstairs kitchen, using deterministic model outputs. They did not
-run live CLIP/MiniLM inference, contact Matterport, send texts, or make phone calls.
-
-With the normal backend dependencies installed:
-
-```powershell
-cd C:\Users\Joshua\Projects\hackprinceton-mvp\backend
-.venv\Scripts\python -m unittest discover -s tests -p "test_voice*.py"
-cd ..\voice
-npm test
-```
-
-Voice sessions and retry records are in memory. Use a single backend worker; restarting it
-clears the sessions, so start a new phone conversation. Voice messages identify this as a
-demo and do not claim that real emergency services or responders have been contacted.
-See [voice/README.md](voice/README.md) for the focused voice setup guide.
-
 ## Setup
 
-Requirements: Python 3.11+, Node.js 20+ for messaging/dashboard and 22.9+ for the voice scripts
-(tested with Node 24), and credentials in the **project-root `.env`**. Copy `.env.example` if needed;
-never commit `.env` or expose its contents. Existing process environment variables take precedence.
-The backend and voice scripts read `.env`; `.env.local` is not used for runtime configuration.
+Requirements: Python 3.11+, Node.js 20+, and the credentials below in `.env` (copy `.env.example`; never commit `.env`).
 
 | Variable                  | Used by   | Notes |
 |---------------------------|-----------|-------|
@@ -636,17 +496,11 @@ The backend and voice scripts read `.env`; `.env.local` is not used for runtime 
 | `MATTERPORT_TOKEN_SECRET` | backend   | |
 | `PHOTON_PROJECT_ID`       | messaging | Photon Beta project id (`pho_prj_…`) |
 | `PHOTON_API_KEY`          | messaging | Photon Beta project API key (`pho_sk_…`, needs project read/write) |
-| `DEV_TEST_PHONE`          | dashboard default | Personal caller number prefilled in the dashboard form; not the Photon demo number |
+| `DEV_TEST_PHONE`          | dashboard default | Phone number prefilled in the simulated 911 form |
 | `MESSAGING_MODE`          | backend   | `simulated` (default) or `photon` |
 | `ANTHROPIC_API_KEY`       | backend   | Optional. Turns on Claude follow-ups (`llm.py`); leave empty for keyword rules |
 | `MESSAGING_SIDECAR_URL`   | backend   | Default `http://localhost:8787` |
-| `BACKEND_URL`             | messaging, voice gateway, dashboard proxy | Default `http://localhost:8000` |
-| `ELEVENLABS_API_KEY`       | voice setup | Private ElevenLabs API key; root `.env` only |
-| `ELEVENLABS_AGENT_ID`      | voice setup | Created agent ID; reused on setup updates |
-| `ELEVENLABS_VOICE_SECRET_ID` | voice setup | Stored ElevenLabs workspace secret for gateway authentication |
-| `VOICE_TOOL_TOKEN`        | backend, gateway, setup | Shared bearer credential generated by voice setup |
-| `VOICE_PUBLIC_URL`        | voice setup | HTTPS tunnel URL used by the agent's server tools |
-| `VOICE_GATEWAY_PORT`      | voice gateway | Default `8788` |
+| `BACKEND_URL`             | messaging, dashboard proxy | Default `http://localhost:8000` |
 
 ```bash
 # Backend
@@ -667,29 +521,22 @@ cd dashboard && npm install && npm run dev        # http://localhost:5173
 cd messaging && npm start                         # no dependencies; the caller's phone must text the shared line first
 ```
 
-Tests: `cd backend && .venv/Scripts/python -m pytest` (existing locator tests plus the added voice tests). `test_semantics.py` downloads the ~90 MB
+Tests: `cd backend && .venv/Scripts/python -m pytest` (279 tests). `test_semantics.py` downloads the ~90 MB
 paraphrase model on first run; the rest need no network.
 Scenario check: `cd backend && .venv/Scripts/python scripts/eval_scenarios.py [-v]` (ingests the three test
 buildings on first run).
 
-### Changing the caller number and restarting
-
-Set `DEV_TEST_PHONE=+1YOURNUMBER` in the root `.env` using international format. Restart the
-**FastAPI backend** (Ctrl+C in its terminal, then run the same uvicorn command again) and fully
-refresh the dashboard. The form only prefills an empty phone field. This setting does not change
-the Photon number or ElevenLabs assignment. A caller-number-only change does not require
-restarting the dashboard server, gateway, or tunnel. For a changed `VOICE_TOOL_TOKEN`, restart
-both backend and gateway and update the agent's secret/configuration consistently.
-
 ## Demo script
 
-For **voice**, first complete the Voice calling setup above. Open the dashboard, call the Photon
-number from your personal phone, provide the address, and describe the room. The session appears
-automatically; do **not** use the dashboard's `Start call` button to initiate that phone session.
-That button still creates a text/simulated session. Do not dial actual 911 for this demo.
-
-For **text/simulated** mode:
-
+0. **Preflight (the night before, and again on the morning of the demo, on the laptop with the `.env` keys):**
+   `cd backend && .venv/Scripts/python scripts/preflight_demo.py`. For every building in the repo-root
+   `demo_buildings.json` it resolves the address the way a call does, ingests the model if the cache is missing or
+   stale (minutes per building, once), fetches orientation, runs two scripted caller messages through the real call
+   flow, and prints a READY / NOT READY table with timings (exit code 0 only if all are READY). Messaging is forced to
+   `simulated`, so it never texts anyone. `--only Chipman` checks one building; `--no-self-test` skips the scripted
+   call. Add a building by appending `{address, label, model_id, note, self_test, expect_room}` to the JSON file.
+   On the dashboard, the **Demo buildings** menu above the address fills it in (✓ cached, ⚠ not cached; a
+   not-cached choice warns that the first call will take a few minutes to load).
 1. Open the dashboard and enter a phone number and `13122 Chipman Glen Dr, Houston, TX`.
 2. As the caller (simulated box, or a real phone in `photon` mode), describe the room. The sample house is empty,
    so describe fixtures: "there's a brick fireplace and a big window" (living area) or "I can see a stove and a
@@ -697,10 +544,7 @@ For **text/simulated** mode:
 3. Answer the follow-ups (yes/no via the quick buttons, or type "tile", "closet-sized", "I see a stove") until the
    dot appears. Try a vague opening like "I'm in a cramped space" to see the follow-ups narrow it down.
 4. Click any room (on the plan or in the probability list) to see all of its photos.
-5. Where in the room: in the sample house say "I'm in the living room", then answer the "what's closest to you?"
-   questions ("the glass door to outside", "the fireplace"). The dot moves to the fireplace corner and the circle
-   shrinks.
-6. Multi-floor: call `3012 Houston Ave, Houston, TX` and say "I'm in an empty room with built-in shelves". The
+5. Multi-floor: call `3012 Houston Ave, Houston, TX` and say "I'm in an empty room with built-in shelves". The
    floor question comes first; answer "3rd floor". Floor tabs above the plan show each floor's probability.
 
 ## Known limitations
@@ -709,16 +553,18 @@ For **text/simulated** mode:
 - An approximate address match (e.g. the neighbouring house) is a *different building*. The dashboard flags it, and
   the dispatcher should confirm it with the caller.
 - Address matching is tuned for US street addresses; other formats are untested.
-- The spot within a room is only as fine as the scan points (about 1.5 m apart) and the landmarks in view. It
-  can't place the caller between scan points beyond that, or in rooms without photos.
-- Rooms without photos are scored like the photographed rooms of the same type, so they can't be told apart from
-  each other (or from their photographed sibling) by appearance; floor, size and room-type words separate them.
+- Rooms without sweeps can only be chosen by room-type words.
 - Visually similar rooms (the sample's empty bedrooms) are confused, sometimes with high confidence.
 - Without `ANTHROPIC_API_KEY`, follow-ups use templates, and replies are read by keywords plus paraphrase matching
   against fixed example phrasings. Phrasing far from those examples is only understood through CLIP. The
   optional Claude layer is untested live.
 - Room-label associations (toilet → bathroom, washer → laundry) are assumptions; a mislabeled room or a laundry
-  room without a machine misleads them.
+  room without a machine misleads them. The commonsense guard trusts labels too: in a room mislabeled "Garage", a
+  real toilet is capped at 0.08 per answer (not ruled out).
 - `LOGIT_SCALE` and the confidence values in `config.py` were hand-tuned on the sample model, not calibrated.
 - Sessions live in memory; restarting the backend clears them.
 - Photon's shared iMessage line can't start a conversation: a caller must text it first (see Messaging).
+
+## Voice demo
+
+See [voice setup and verification](voice/README.md).

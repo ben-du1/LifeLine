@@ -15,6 +15,18 @@
   --wall: #383c33;
   --ok: #39543d;
   --warn: #82501c;
+  --sheet: var(--surface);
+  --grid: var(--map);
+  --ink: var(--text);
+  --graphite: var(--muted);
+  --rule: var(--border);
+  --signal: var(--accent);
+  --caution: var(--warn);
+  --caution-wash: var(--accent-soft);
+  --clear: var(--ok);
+  --region: var(--accent);
+  --region-fill: 0.1;
+  --sign: Inter, "Helvetica Neue", Arial, sans-serif;
   font-family: Inter, "Helvetica Neue", Arial, sans-serif;
   color: var(--text);
 }
@@ -330,4 +342,48 @@ button.floor-tab.active { border-color: var(--room); background: var(--bg); font
 }
 @media (prefers-reduced-motion: reduce) {
   .room-fill, .sweep, .bar span { transition: none; }
+}
+
+.side-title { font-size: 0.95rem; }
+.demo-warning { color: var(--caution); font-size: 0.8rem; font-weight: 600; }
+.empty { color: var(--graphite); padding: 80px 20px; text-align: center; }
+.region-area { fill: var(--region); fill-opacity: var(--region-fill); stroke: var(--region); stroke-opacity: 0.55;
+  stroke-width: 0.05; stroke-dasharray: 0.25 0.15; pointer-events: none; }
+.region-sweep { fill: var(--region); pointer-events: none; transition: r 0.4s, fill-opacity 0.4s; }
+.plan-tools { display: flex; justify-content: flex-end; margin-bottom: -6px; }
+.zoom-toggle { padding: 4px 10px; font-size: 0.82rem; }
+.zoom-toggle[aria-pressed="true"] { background: var(--ink); border-color: var(--ink); color: var(--sheet); }
+/* Approach: what responders arriving from the street need, in signage type. */
+.approach-card { display: flex; gap: 16px; padding: 12px 0 12px 14px; border-left: 4px solid var(--signal); }
+.approach-card.interior { border-left-color: var(--caution); }
+.approach-main { flex: 1; min-width: 0; }
+.approach-big { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 14px; font-family: var(--sign);
+  font-weight: 600; font-size: 1.75rem; line-height: 1.1; }
+.approach-floor { color: var(--signal); }
+.approach-text { margin: 4px 0 8px; font-size: 0.92rem; max-width: 70ch; }
+.approach-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; font-size: 0.82rem; color: var(--graphite); }
+.approach-tag.front { color: var(--clear); font-weight: 600; }
+.approach-tag.warn { color: var(--caution); font-weight: 600; }
+.approach-photo img { display: block; width: 220px; max-width: 100%; border: 1px solid var(--rule); }
+.tie-group { display: flex; flex-direction: column; padding: 6px 0 2px 10px; margin: 2px 0;
+  border-left: 3px solid var(--caution); background: color-mix(in srgb, var(--caution-wash) 55%, transparent); }
+.tie-label { font-size: 0.82rem; font-weight: 600; color: var(--caution); }
+@media (prefers-reduced-motion: reduce) { .region-sweep { transition: none; } }
+.approach-meta a { font-weight: 600; }
+/* Map preview under the address field (AddressMap.jsx): where the typed address is, before the call starts. */
+.address-map { height: 190px; border: 1px solid var(--rule); background: var(--grid); }
+.address-map .leaflet-control-attribution { font-size: 9px; }
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.msg-effect {
+  color: var(--muted);
+  font-size: 0.75rem;
 }

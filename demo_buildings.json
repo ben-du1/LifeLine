@@ -1,0 +1,26 @@
+[
+  {
+    "address": "13122 Chipman Glen Dr, Houston, TX",
+    "label": "Chipman Glen (vacant, 1 floor)",
+    "model_id": "3QuftVC2agD",
+    "note": "Track sample model. Empty house: describe fixtures (stove, fireplace, windows).",
+    "self_test": ["I can see a stove and a fridge", "yes"],
+    "expect_room": "Dining Room / Kitchen / Living Room"
+  },
+  {
+    "address": "7921 Pointer St, Houston, TX",
+    "label": "Pointer St (furnished, 1 floor)",
+    "model_id": null,
+    "note": "Furnished house: beds, couches, a pantry with shelves.",
+    "self_test": ["I'm next to the stove", "yes"],
+    "expect_room": "Kitchen"
+  },
+  {
+    "address": "3012 Houston Ave, Houston, TX",
+    "label": "3012 Houston Ave (4 floors)",
+    "model_id": "M7BdXkpzrrE",
+    "note": "Multi-floor: the floor question comes first. Try \"empty room with built-in shelves\", then \"3rd floor\".",
+    "self_test": ["I'm in an empty room with built-in shelves", "3rd floor"],
+    "expect_room": "Game Room"
+  }
+]

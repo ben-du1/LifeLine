@@ -42,7 +42,7 @@ class VoiceBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.manager.handle_reply.assert_awaited_once_with(self.session, "yes, actually upstairs")
         self.assertEqual(await self.bridge.reply("c1", transcript), result)
         self.assertEqual(self.manager.handle_reply.await_count, 1)
-        await self.bridge.reply("c1", history("address", "yes", "yes"))
+        await self.bridge.reply("c1", history("1 Main St", "yes, actually upstairs", "yes"))
         self.assertEqual(self.manager.handle_reply.await_count, 2)
 
     async def test_loading_polls_without_resubmitting_answer(self):

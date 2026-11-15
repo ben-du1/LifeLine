@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -19,11 +20,12 @@ class VoiceError(ValueError):
 class VoiceCall:
     session: "Session"
     delivered: int = 0
+    loading_deadline: float = field(default_factory=lambda: time.monotonic() + 60)
     replies: dict[int, tuple[str, dict]] = field(default_factory=dict)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
-def latest_reply(history: str) -> tuple[int, str]:
+def caller_messages(history: str) -> list[str]:
     """Use the platform transcript rather than an LLM paraphrase of a caller's answer."""
     try:
         entries = json.loads(history)["entries"]
@@ -35,6 +37,11 @@ def latest_reply(history: str) -> tuple[int, str]:
         raise VoiceError("The conversation has no caller answer.")
     if len(users[-1]) > 8000:
         raise VoiceError("Caller answer is too long.")
+    return users
+
+
+def latest_reply(history: str) -> tuple[int, str]:
+    users = caller_messages(history)
     return len(users), users[-1]
 
 
@@ -84,20 +91,27 @@ class VoiceBridge:
                 "instruction": "Ask this question. If the caller already described the room, submit that answer now."}
 
     async def reply(self, conversation_id: str, history: str) -> dict:
-        turn, text = latest_reply(history)
+        users = caller_messages(history)
+        turn, text = len(users), users[-1]
         call = self._call(conversation_id)
         async with call.lock:
+            if any(users[n - 1] != old for n, (old, _) in call.replies.items() if n <= turn):
+                raise VoiceError("A processed transcript turn cannot be changed.", 409)
             if turn in call.replies:
                 previous_text, response = call.replies[turn]
                 if previous_text != text:
                     raise VoiceError("A processed transcript turn cannot be changed.", 409)
+                if response["pending"] and call.session.ready.is_set():
+                    response = await self._result(call)
+                    call.replies[turn] = (text, response)
                 return response
             if call.replies and turn < max(call.replies):
                 raise VoiceError("This transcript is older than the last processed answer.", 409)
             # If loading is unfinished, handle_reply queues the exact answer for _load.
             # Skip all earlier messages, including the opening already returned by start.
             call.delivered = max(call.delivered, 1)
-            await self.manager.handle_reply(call.session, text)
+            previous = max(call.replies, default=turn - 1)
+            await self.manager.handle_reply(call.session, " ".join(users[previous:]))
             response = await self._result(call)
             call.replies[turn] = (text, response)
             return response
@@ -112,6 +126,9 @@ class VoiceBridge:
         try:
             await asyncio.wait_for(session.ready.wait(), timeout=self.wait_seconds)
         except TimeoutError:
+            if time.monotonic() >= call.loading_deadline:
+                return {"session_id": session.id, "status": "error", "pending": False,
+                        "say": "The building took too long to load.", "awaiting_answer": False}
             return {"session_id": session.id, "status": "loading", "pending": True,
                     "say": "I'm still loading the building's interior.",
                     "instruction": "Call location_status again. Do not resubmit the caller's answer."}

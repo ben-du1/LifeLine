@@ -57,8 +57,9 @@ def test_follow_up_after_cramped_targets_small_rooms():
     posterior = locator.apply_likelihood(locator.uniform_room_prior(building.candidate_room, 4), reading.likelihood)
     plan = followups.choose(model, posterior, building.candidate_room, 4, reading.covered, None)
     asked_about = set(plan.items) if plan.kind == "list" else {plan.key}
-    # The follow-up must be about something that separates a closet from a bathroom, not about size again.
-    assert asked_about & {"toilet", "sink", "mirror", "shelves"} and "size" not in asked_about
+    # The follow-up must be about something that separates a closet from a bathroom, not about size again. Flooring
+    # qualifies: bathrooms are essentially never carpeted (followups._NEVER_CARPETED).
+    assert asked_about & {"toilet", "sink", "mirror", "shelves", "flooring"} and "size" not in asked_about
     assert followups.phrase(plan, reading.acknowledgement).startswith("You said it's a tight space.")
 
 
@@ -134,43 +135,70 @@ def test_single_floor_buildings_never_ask_about_floors():
     assert plan.key != "floor"
 
 
-def make_kitchen_with_three_scans():
-    """One kitchen scanned at three spots: by the stove, by the sink, by the window."""
-    rooms = [{"id": "k", "name": "Kitchen", "types": ["Kitchen"], "floor": 0, "polygon": square(6.0), "walls": []},
-             {"id": "b", "name": "Bedroom", "types": ["Bedroom"], "floor": 0, "polygon": square(4.0), "walls": []}]
-    candidates = [{"views": ["s"], "x": 0.5, "y": 0.5}, {"views": ["k"], "x": 5.5, "y": 0.5},
-                  {"views": ["w"], "x": 3.0, "y": 5.5}, {"views": ["b"], "x": 9.0, "y": 2.0}]
-    building = Building(
-        id="k3", name="k3", address="3 C St", floors=[{"index": 0, "id": "f0", "label": "Floor 1"}], floorplans={},
-        rooms=rooms, candidates=candidates, candidate_room=np.array([0, 0, 0, 1]),
-        has_views=np.array([True, True, True, True]), view_embeddings=np.eye(4, dtype=np.float32),
-        view_candidate=np.array([0, 1, 2, 3]),
-    )
-    scores = {p: np.zeros(4) for p in followups.clip_prompts()}
-    scores[followups.near_prompt("stove")] = np.array([0.30, 0.20, 0.20, 0.20])
-    scores[followups.near_prompt("sink")] = np.array([0.20, 0.30, 0.20, 0.20])
-    scores[followups.near_prompt("window")] = np.array([0.20, 0.20, 0.30, 0.20])
+# ---- calibrated CLIP presence (contrast against neutral prompts) -----------------------------------------------
+
+WINDOW = followups.FEATURES_BY_KEY["window"].prompt  # no room types, so p_yes is CLIP alone
+WASHER = followups.FEATURES_BY_KEY["washer"].prompt
+
+
+def contrast_scores(feature_scores: dict[str, list[float]]) -> dict[str, np.ndarray]:
+    """Per-candidate raw scores: every prompt at 0.20 (the neutral level) unless given; ensemble phrasings copy their
+    original prompt."""
+    scores = {p: np.full(4, 0.20) for p in followups.clip_prompts()}
+    for prompt, values in feature_scores.items():
+        for p in followups._ensemble(prompt):
+            scores[p] = np.array(values)
+    return scores
+
+
+def test_feature_absent_everywhere_is_unlikely_everywhere(monkeypatch):
+    monkeypatch.setattr(followups.config, "CLIP_CALIBRATED", True)
+    building, _ = make_model()
+    # Below or tied with the neutral prompts in every imaged room: the old z-score called the best of them ~0.8.
+    scores = contrast_scores({WINDOW: [0.18, 0.20, 0.20, 0.17], WASHER: [0.19, 0.20, 0.16, 0.20]})
     model = followups.build_model(building, scores)
-    model.p_yes["window"] = np.full(4, 0.8)   # the kitchen has windows (no CLIP signal in this toy model)
-    return building, model
+    for key in ("window", "washer"):
+        assert model.p_yes[key][building.has_views].max() < 0.3, key  # photo-less rooms have no CLIP evidence
 
 
-def test_nearest_question_narrows_the_position_inside_the_room():
-    building, model = make_kitchen_with_three_scans()
-    xy = np.array([[c["x"], c["y"]] for c in building.candidates])
-    posterior = np.array([0.33, 0.33, 0.33, 0.01])                     # kitchen known, spot unknown
-    plan = followups.refinement(model, posterior, 0, xy, set())
-    assert plan.kind == "nearest" and {"stove", "sink"} <= set(plan.items)
-    reading = followups.read_message("I'm right by the sink", model, plan, "free")
-    assert reading.likelihood is None                                   # nothing about which room
-    post = locator.apply_within_rooms(posterior, reading.position, building.candidate_room)
-    assert post[1] > 0.6 and np.isclose(post[3], posterior[3] / posterior.sum())   # the bedroom keeps its share
-    none = followups.read_message("none of those", model, plan, "no")
-    assert none.position is not None                                    # "none" is evidence too
+def test_feature_present_in_one_room_is_likely_there_only(monkeypatch):
+    monkeypatch.setattr(followups.config, "CLIP_CALIBRATED", True)
+    building, _ = make_model()
+    model = followups.build_model(building, contrast_scores({WINDOW: [0.18, 0.20, 0.19, 0.28]}))
+    p = model.p_yes["window"]
+    assert p[3] > 0.8 and p[[0, 2]].max() < 0.3
+    assert p[1] == 0.5  # the photo-less bathroom has no CLIP evidence and no room type for windows
 
 
-def test_no_nearest_question_when_position_is_already_tight_or_room_has_one_scan():
-    building, model = make_kitchen_with_three_scans()
-    xy = np.array([[c["x"], c["y"]] for c in building.candidates])
-    assert followups.refinement(model, np.array([0.98, 0.01, 0.0, 0.01]), 0, xy, set()) is None   # tight
-    assert followups.refinement(model, np.array([0.0, 0.0, 0.0, 1.0]), 1, xy, set()) is None      # one scan
+def test_without_baseline_prompts_clip_presence_stays_relative():
+    building, _ = make_model()
+    raw = np.array([0.18, 0.20, 0.19, 0.28])
+    scores = {p: raw for p in followups.clip_prompts() if p not in followups.BASELINE_PROMPTS}
+    p = followups.build_model(building, scores).p_yes["window"]
+    imaged = raw[[0, 2, 3]]
+    expected = followups._sigmoid(1.5 * (imaged - imaged.mean()) / (imaged.std() + 1e-6))
+    assert np.allclose(p[[0, 2, 3]], np.clip(expected, 0.05, 0.95))
+
+
+def test_view_contrast_ignores_a_cluttered_view(monkeypatch):
+    """Per-view baseline: a busy face that scores high against every prompt (neutral ones too) doesn't look like a
+    window, while a face where only the window prompt is high does. One-hot view embeddings make each prompt
+    vector's entries its per-view cosines."""
+    monkeypatch.setattr(followups.config, "CLIP_CALIBRATED", True)
+    building, _ = make_model()
+    building.view_embeddings = np.eye(4, dtype=np.float32)
+    building.view_candidate = np.array([0, 0, 2, 3])  # closet has a plain and a cluttered face
+    vectors = {p: np.array([0.20, 0.30, 0.20, 0.20]) for p in followups.clip_prompts()}  # face 1 is cluttered
+    for p in followups._ensemble(WINDOW):
+        vectors[p] = np.array([0.19, 0.31, 0.19, 0.28])  # window only in the kitchen (face 3)
+    contrast = followups.view_contrast(building, vectors)
+    scores = {p: building.candidate_scores(v) for p, v in vectors.items()}
+    p = followups.build_model(building, scores, contrast).p_yes["window"]
+    assert p[3] > 0.8 and p[0] < 0.3 and p[2] < 0.3
+
+
+def test_floor_destinations_and_negations_are_not_positive_floor_evidence():
+    options = followups.floor_options(3)
+    assert followups.stated_floors("not the second floor", options) == ()
+    assert followups.stated_floors("I'm by the stairs to the second floor", options) == ()
+    assert followups.stated_floors("I'm on the third floor", options) == (2,)

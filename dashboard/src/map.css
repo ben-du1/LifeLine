@@ -1,0 +1,46 @@
+/* Map view (MapView.jsx): the plan on street, satellite or Vexcel imagery. Loaded with the lazy map chunk. */
+.map-view { display: flex; flex-direction: column; gap: 8px; }
+.map-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+.map-links { display: flex; gap: 10px; align-items: center; font-size: 0.85rem; }
+.map-links a { color: var(--room); }
+.map-links button { padding: 4px 10px; font-size: 0.85rem; }
+.map-links button.active { border-color: var(--accent); background: var(--accent-soft); font-weight: 600; }
+.map-frame { position: relative; }
+.map { height: 58vh; min-height: 360px; border-radius: 6px; background: var(--bg); }
+
+.align-control {
+  position: absolute; top: 10px; right: 10px; z-index: 1000;
+  display: flex; flex-direction: column; gap: 6px; align-items: center;
+  padding: 8px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 2px 8px rgb(0 0 0 / 0.2);
+}
+.align-pad {
+  display: grid; gap: 4px;
+  grid-template-columns: repeat(3, 32px);
+  grid-template-areas: "l n r" "w . e" ". s .";
+}
+.align-pad button, .align-actions button { padding: 4px 0; font-size: 0.9rem; }
+.align-actions { display: flex; gap: 4px; }
+.align-actions button { padding: 3px 8px; font-size: 0.8rem; }
+.align-readout { font-size: 0.75rem; font-variant-numeric: tabular-nums; }
+
+/* Room names on the map: Leaflet tooltips without the speech-bubble chrome. */
+.leaflet-tooltip.map-room-label {
+  background: rgb(255 255 255 / 0.85); border: none; box-shadow: none; padding: 1px 5px;
+  font-size: 0.75rem; font-weight: 600; color: #1c2330;
+}
+.leaflet-tooltip.map-room-label::before { display: none; }
+
+.map-street span {
+  position: absolute; white-space: nowrap; padding: 1px 6px; border-radius: 4px;
+  background: rgb(28 35 48 / 0.75); color: #fff; font-size: 0.75rem; font-weight: 600;
+}
+
+/* Caller marker: same red pulse as the plan, amber while tentative. */
+.map-marker { position: relative; }
+.map-marker span { position: absolute; border-radius: 50%; }
+.map-marker-dot { inset: 9px; background: var(--accent); border: 2px solid #fff; }
+.map-marker-pulse { inset: 0; background: var(--accent); opacity: 0.3; }
+.map-marker.located .map-marker-pulse { animation: pulse 1.6s ease-out infinite; }
+.map-marker.tentative .map-marker-dot, .map-marker.tentative .map-marker-pulse { background: var(--warn); }
+@media (prefers-reduced-motion: reduce) { .map-marker.located .map-marker-pulse { animation: none; } }

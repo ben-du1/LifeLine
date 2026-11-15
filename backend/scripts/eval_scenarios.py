@@ -65,6 +65,10 @@ def answer(plan: followups.Plan, facts: dict) -> str:
         return facts.get(plan.key, "no")
     if plan.kind == "choice":
         return facts.get(plan.key, "I don't know")
+    if plan.kind in ("position", "near"):
+        # The fact sheets don't say which rooms share walls or which landmark is closest: a truthful caller who
+        # doesn't know says so (answering "none of those" would read as a confident "no").
+        return "I'm not sure"
     seen = [followups.FEATURES_BY_KEY[k].noun.split(" or ")[0] for k in plan.items if facts.get(k) == "yes"]
     return f"I see {' and '.join(seen)}" if seen else "none of those"
 

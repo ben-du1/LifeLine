@@ -7,12 +7,27 @@ above config.ADDRESS_MATCH_THRESHOLD are used.
 The two sides are parsed differently on purpose. Matterport addresses are consistently formatted
 ("4010 W Bellfort Ave, 227, Houston, TX, 77025, US"), so they are split on commas. Caller/dispatcher input is free-form
 ("13122 chipman glen drive houston"), so it is treated as a bag of tokens, and the street is whatever sits between
-the house number and the first street suffix, comma, or state/ZIP.
+the house number and the first street suffix, comma, or state/ZIP. Callers who text or speak the address go through
+parse_caller first (spoken numbers, filler, then the trained usaddress parser), which falls back to parse_freeform.
 """
 
 import re
 from dataclasses import dataclass
-from difflib import SequenceMatcher
+from functools import lru_cache
+
+import usaddress
+from text_to_num import alpha2digit
+
+try:  # rapidfuzz is ~20x faster than difflib for the same ratio; difflib stays as a fallback
+    from rapidfuzz.fuzz import ratio as _fuzz_ratio
+
+    def _ratio(a: str, b: str) -> float:
+        return _fuzz_ratio(a, b) / 100
+except ImportError:  # pragma: no cover
+    from difflib import SequenceMatcher
+
+    def _ratio(a: str, b: str) -> float:
+        return SequenceMatcher(None, a, b).ratio()
 
 # Spelled-out and abbreviated forms are mapped to one canonical token so "Drive" == "Dr".
 SUFFIXES = {
@@ -32,6 +47,18 @@ STATES = {
     "pa", "ri", "sc", "sd", "tn", "tx", "ut", "vt", "va", "wa", "wv", "wi", "wy", "pr",
 }
 COUNTRY_WORDS = {"us", "usa", "united", "states"}
+STATE_NAMES = {
+    "alabama": "al", "alaska": "ak", "arizona": "az", "arkansas": "ar", "california": "ca", "colorado": "co",
+    "connecticut": "ct", "delaware": "de", "florida": "fl", "georgia": "ga", "hawaii": "hi", "idaho": "id",
+    "illinois": "il", "indiana": "in", "iowa": "ia", "kansas": "ks", "kentucky": "ky", "louisiana": "la",
+    "maine": "me", "maryland": "md", "massachusetts": "ma", "michigan": "mi", "minnesota": "mn", "mississippi": "ms",
+    "missouri": "mo", "montana": "mt", "nebraska": "ne", "nevada": "nv", "new hampshire": "nh", "new jersey": "nj",
+    "new mexico": "nm", "new york": "ny", "north carolina": "nc", "north dakota": "nd", "ohio": "oh",
+    "oklahoma": "ok", "oregon": "or", "pennsylvania": "pa", "rhode island": "ri", "south carolina": "sc",
+    "south dakota": "sd", "tennessee": "tn", "texas": "tx", "utah": "ut", "vermont": "vt", "virginia": "va",
+    "washington": "wa", "west virginia": "wv", "wisconsin": "wi", "wyoming": "wy", "puerto rico": "pr",
+    "district of columbia": "dc",
+}
 
 # Component weights for the final score. The street name is the strongest identity signal; the house number
 # separates houses on that street; city/state/ZIP mainly rejects same-named streets in other cities.
@@ -127,12 +154,100 @@ def parse_freeform(text: str) -> Address:
     return Address(number, _street_words(street), unit, city, state, zip_code, tokens)
 
 
+# ---- caller input: spoken or typed, possibly with filler ("um it's 13122 chipman glen in houston texas")
+
+# Words a caller puts before the address. Only used when the address has no house number to start at.
+_LEAD_FILLER = re.compile(r"^(?:(?:um+|uh+|er+|so|okay|ok|yeah|yes|hi|hello|well|it'?s|it is|i'?m|i am|we'?re|we are|"
+                          r"i live|we live|my address is|the address is|address is|at|on|in|the)\b[\s,.:]*)+", re.I)
+# Words that join the street and the city in speech; usaddress reads "glen in houston" as street type "in".
+_JOINERS = re.compile(r"\s+(?:in|at|near)\s+", re.I)
+# Words between the street words that are never part of a street name.
+_STOP_WORDS = {"in", "at", "on", "of", "near", "by", "the"}
+
+
+def _group_house_number(text: str) -> str:
+    """Join the digit groups a caller says before the street into one house number: "13 1 22 chipman" -> "13122",
+    "79 21 pointer" -> "7921", "5 oh 5 oak" -> "505". Only leading groups are joined, so "233 W 27th St" is unchanged."""
+    words = text.split()
+    groups = []
+    while words:
+        word = words[0].lower()
+        if word.isdigit():
+            groups.append(word)
+        elif groups and word in ("oh", "o") and len(words) > 1 and words[1].isdigit():
+            groups.append("0")   # "five oh five": a spoken zero between digits
+        else:
+            break
+        words.pop(0)
+    return " ".join(["".join(groups)] + words) if groups else text
+
+
+def clean_caller(text: str) -> str:
+    """The caller's text reduced to the address: spoken numbers as digits, digit groups joined, filler before the
+    house number dropped, and speech joiners ("in houston") turned into commas. Case is kept for display."""
+    text = " ".join(text.replace("\n", " ").split())
+    try:
+        converted = alpha2digit(text, "en")
+    except Exception:  # text2num rejects some odd inputs; the plain text still parses
+        converted = text
+    # The house number: digits followed by a word ("13122 chipman", "13 1 22 chipman", "5 oh 5 oak"). A number
+    # followed by a comma is a ZIP or unit ("Princeton, NJ, 08544, US") and is not a place to start.
+    house = re.search(r"\b\d+(?:\s+(?:\d+|oh|o)\b)*\s+[A-Za-z]", converted, re.I)
+    if house:
+        converted = converted[house.start():]   # start at the house number: drops "um it's", "I'm at"
+    else:
+        converted = _LEAD_FILLER.sub("", converted)
+    converted = _group_house_number(converted)
+    converted = _JOINERS.sub(", ", converted)
+    return converted.strip(" ,.")
+
+
+def _split_state(words: list[str]) -> tuple[list[str], str | None]:
+    """Take a trailing state ("houston texas", "princeton nj") off a city."""
+    for size in (3, 2, 1):
+        tail = " ".join(words[-size:]) if len(words) >= size else ""
+        if tail in STATE_NAMES:
+            return words[:-size], STATE_NAMES[tail]
+    if len(words) > 1 and words[-1] in STATES:
+        return words[:-1], words[-1]
+    return words, None
+
+
+@lru_cache(maxsize=512)  # one caller address is compared with every candidate; callers must not mutate the result
+def parse_caller(text: str) -> Address:
+    """Parse a caller's address with usaddress (a trained US parser) after clean_caller. Falls back to
+    parse_freeform when usaddress can't label it or finds no street."""
+    cleaned = clean_caller(text)
+    try:
+        tagged, _kind = usaddress.tag(cleaned)
+    except usaddress.RepeatedLabelError:
+        return parse_freeform(cleaned)
+    street_text = " ".join(tagged.get(k, "") for k in (
+        "StreetNamePreDirectional", "StreetNamePreModifier", "StreetNamePreType", "StreetName",
+        "StreetNamePostType", "StreetNamePostDirectional"))
+    street = [w for w in _street_words(_tokens(street_text)) if w not in _STOP_WORDS]
+    number_match = re.match(r"\d+", tagged.get("AddressNumber", ""))
+    if not street or any(w.isdigit() for w in street) or (tagged.get("AddressNumber") and not number_match):
+        # No street, a number inside the street ("1 22 chipman"), or a word read as the house number ("I'm on
+        # Chipman Glen"): the trained parser got lost, so use the hand-written one.
+        return parse_freeform(cleaned)
+    unit = "".join(w for w in _tokens(tagged.get("OccupancyIdentifier", "")) if w not in UNIT_WORDS).lstrip("#")
+    city = [w for w in _tokens(tagged.get("PlaceName", "")) if not w.isdigit()]
+    city, state_from_city = _split_state(city)
+    state = tagged.get("StateName", "").lower().strip(". ") or state_from_city
+    state = STATE_NAMES.get(state, state)
+    zip_match = re.match(r"\d{5}", tagged.get("ZipCode", ""))
+    return Address(number=number_match.group() if number_match else None, street=street, unit=unit or None,
+                   city=city, state=state if state in STATES else None,
+                   zip=zip_match.group() if zip_match else None, tokens=_tokens(cleaned))
+
+
 def _token_similarity(a: str, b: str) -> float:
     if a == b:
         return 1.0
     if a.isdigit() or b.isdigit():  # "26th" vs "27th" or "2nd" vs "3rd" are different streets, not typos
         return 0.0
-    ratio = SequenceMatcher(None, a, b).ratio()
+    ratio = _ratio(a, b)
     return ratio if ratio >= TOKEN_MATCH_MIN else 0.0
 
 
@@ -188,7 +303,7 @@ def _locality_score(query: Address, candidate: Address) -> float | None:
 
 def similarity(query_text: str, candidate_text: str) -> float:
     """0..1 similarity between a free-form address and a Matterport-formatted one."""
-    query, candidate = parse_freeform(query_text), parse_matterport(candidate_text)
+    query, candidate = parse_caller(query_text), parse_matterport(candidate_text)
     if not candidate.street:
         return 0.0
     parts = [(STREET_WEIGHT, _street_score(query, candidate)),
@@ -216,6 +331,9 @@ def with_locality(name: str, address: str) -> str:
 
 
 def is_exact(query_text: str, candidate_text: str) -> bool:
-    """Same house number and street words (suffix and city formatting aside)."""
-    query, candidate = parse_freeform(query_text), parse_matterport(candidate_text)
+    """Same house number and street words (suffix and city formatting aside), and no conflicting unit: "700 Dunson
+    Glen Dr Unit 1013" is not exactly "..., Unit 107", but a query without a unit is exact for every unit."""
+    query, candidate = parse_caller(query_text), parse_matterport(candidate_text)
+    if query.unit and candidate.unit and query.unit != candidate.unit:
+        return False
     return query.number is not None and query.number == candidate.number and query.street == candidate.street

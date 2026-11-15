@@ -81,9 +81,11 @@ def search_models(address: str) -> list[dict]:
     return list(found.values())
 
 
-def rank_matches(address: str, models: list[dict]) -> list[dict]:
-    """Models whose address is sufficiently similar (config.ADDRESS_MATCH_THRESHOLD), best first, each with
-    `score` and `exact` added. Ties keep the input order (local cache first, then Matterport's rank)."""
+def rank_matches(address: str, models: list[dict], threshold: float | None = None) -> list[dict]:
+    """Models whose address is sufficiently similar (`threshold`, default config.ADDRESS_MATCH_THRESHOLD), best
+    first, each with `score` and `exact` added. Ties keep the input order (local cache first, then Matterport's
+    rank). resolve.py passes the lower config.ADDRESS_CLARIFY_THRESHOLD to find models worth asking about."""
+    threshold = config.ADDRESS_MATCH_THRESHOLD if threshold is None else threshold
     scored = []
     for model in models:
         # Some models carry the address only in the name ("7921 Pointer St"), so the better of the two counts. The
@@ -93,7 +95,7 @@ def rank_matches(address: str, models: list[dict]) -> list[dict]:
         # beat the real Princeton model on the tie because it was cached.
         texts = [t for t in (model["address"], addresses.with_locality(model["name"], model["address"])) if t]
         score = max((addresses.similarity(address, t) for t in texts), default=0.0)
-        if score >= config.ADDRESS_MATCH_THRESHOLD:
+        if score >= threshold:
             scored.append({**model, "address": model["address"] or model["name"], "score": round(score, 3),
                            "exact": any(addresses.is_exact(address, t) for t in texts)})
     return sorted(scored, key=lambda m: -m["score"])
